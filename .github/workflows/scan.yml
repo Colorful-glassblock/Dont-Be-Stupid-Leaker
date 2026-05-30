@@ -31,7 +31,6 @@ jobs:
       
       - name: Run API Key Scanner
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: python .github/scripts/scan_keys.py
       
