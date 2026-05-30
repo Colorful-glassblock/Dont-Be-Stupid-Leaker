@@ -24,9 +24,8 @@ REPO_NAME = os.environ.get("GITHUB_REPOSITORY", "Colorful-glassblock/Dont-Be-Stu
 BOT_NAME = "LLMApiCheckBot"
 BOT_SIGNATURE = f"*This message was sent by {BOT_NAME} - Repository: {REPO_NAME}*"
 
-# Search queries
 ISSUE_QUERY = '"your key leak"'
-CODE_QUERY = 'sk- OR sk-proj- OR AIza OR sk-ant-api OR tp- extension:json OR extension:env OR extension:yaml OR extension:txt OR extension:md'
+CODE_QUERY = 'sk- OR sk-proj- OR AIza OR sk-ant-api OR r8_ OR hf_ OR tp- extension:json OR extension:env OR extension:yaml OR extension:txt OR extension:md'
 
 STATE_FILE = "replied_state.json"
 
@@ -79,6 +78,7 @@ def save_state(state=None):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
 
+# Only reliable providers - removed ZAI and GLM
 KEY_PATTERNS = {
     "OpenAI": re.compile(r"sk-proj-[a-zA-Z0-9]{32,}"),
     "OpenAI_Legacy": re.compile(r"sk-[a-zA-Z0-9]{32,}"),
@@ -90,8 +90,6 @@ KEY_PATTERNS = {
     "Replicate": re.compile(r"r8_[a-zA-Z0-9]{32,}"),
     "HuggingFace": re.compile(r"hf_[a-zA-Z0-9]{30,}"),
     "MiMo": re.compile(r"tp-[a-zA-Z0-9]{10,}"),
-    "GLM": re.compile(r"sk-[a-zA-Z0-9]{32,}"),
-    "ZAI": re.compile(r"[a-zA-Z0-9]{20,}"),
 }
 
 def _parse_deepseek(code, data):
@@ -126,8 +124,6 @@ VERIFIERS = {
     "Replicate": {"url": "https://api.replicate.com/v1/account", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": lambda c, d: (c == 200, 0, "Valid")},
     "HuggingFace": {"url": "https://huggingface.co/api/whoami", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": lambda c, d: (c == 200, 0, "Valid")},
     "MiMo": {"url": "https://token-plan-cn.xiaomimimo.com/v1/models", "headers": lambda k: {"Authorization": f"Bearer {k}", "X-Plan-Type": "token-plan"}, "method": "GET", "parse": _parse_mimo},
-    "GLM": {"url": "https://open.bigmodel.cn/api/paas/v4/chat/completions", "headers": lambda k: {"Authorization": f"Bearer {k}", "Content-Type": "application/json"}, "method": "POST", "body": lambda: json.dumps({"model": "glm-5.1", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}).encode(), "parse": lambda c, d: (c == 200, 0, "Valid")},
-    "ZAI": {"url": "https://api.z.ai/api/coding/paas/v4/chat/completions", "headers": lambda k: {"Authorization": f"Bearer {k}", "Content-Type": "application/json"}, "method": "POST", "body": lambda: json.dumps({"model": "glm-5.1", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}).encode(), "parse": lambda c, d: (c == 200, 0, "Valid")},
 }
 
 def verify_key(service, key):
@@ -152,7 +148,7 @@ def verify_key(service, key):
 
 def build_code_reply(author, service, key, info, repo_url, file_path, line_num, line_content, balance):
     masked = key[:12] + "..." + key[-8:] if len(key) > 24 else key
-    loc = f"Location: {file_path}" + (f" (line {line_num})" if line_num else "")
+    loc = f"File: {file_path}" + (f" (line {line_num})" if line_num else "")
     return f"@{author} Your API key has been exposed in a code file!\n\n# Summary\nThis is a **{service}** API key found in [{repo_url}]({repo_url}).\n\n{loc}\nKey preview: `{masked}`\n\nVerification result: {info}\n\n---\n\n**What to do:**\n1. Revoke this key from {service} dashboard\n2. Generate a new key\n3. Remove the key from the file and force-push\n4. Rotate other exposed secrets\n\n**Exposed code:**\n```\n{line_content[:300] if line_content else 'Content too long'}\n```\n\n---\n{BOT_SIGNATURE}"
 
 def build_issue_reply(author, service, key, info, issue_url, location_type, line_num, line_content, balance):
@@ -236,14 +232,10 @@ def check_and_reply():
     
     processed = set()
     
-    # ========== Code Search (代替 Commit Search) ==========
+    # ========== Code Search ==========
     print("\n--- Scanning code files ---")
     try:
-        code_results = search_with_retry(
-            g.search_code,
-            CODE_QUERY
-        )[:30]
-        
+        code_results = search_with_retry(g.search_code, CODE_QUERY)[:30]
         total = len(code_results)
         print(f"Found {total} code files to check")
         
@@ -260,12 +252,10 @@ def check_and_reply():
             file_path = code.path
             file_url = code.html_url
             raw_url = code.download_url
-            
             author = code.repository.owner.login
             
             print(f"[{idx+1}/{total}] Checking {repo_name}/{file_path}")
             
-            # 获取文件内容
             content = ""
             try:
                 resp = requests.get(raw_url, timeout=10)
@@ -275,7 +265,6 @@ def check_and_reply():
                 print(f"  Error fetching file: {e}")
                 continue
             
-            # 提取 Key
             for service, pattern in KEY_PATTERNS.items():
                 for m in pattern.finditer(content):
                     key = m.group(0)
@@ -284,7 +273,6 @@ def check_and_reply():
                         continue
                     print(f"  Found {service} key: {key[:20]}...")
                     
-                    # 找到行号
                     line_num = None
                     line_content = ""
                     lines = content.split('\n')
@@ -299,29 +287,20 @@ def check_and_reply():
                         processed.add(uid)
                         reply = build_code_reply(author, service, key, info, file_url, file_path, line_num, line_content, bal)
                         try:
-                            # 在代码文件的仓库创建 Issue 通知
                             code_repo = g.get_repo(repo_name)
-                            issue_title = f"⚠️ API Key Leak Detected in {file_path}"
-                            issue_body = reply
-                            # 检查是否已有类似 issue
-                            existing = False
-                            for issue in code_repo.get_issues(state="open", labels=["security"]):
-                                if file_path in issue.title:
-                                    existing = True
-                                    break
-                            if not existing:
-                                new_issue = code_repo.create_issue(title=issue_title, body=issue_body, labels=["security"])
-                                mark_code_replied(file_id, state)
-                                save_state(state)
-                                scan_results["replied_count"] += 1
-                                scan_results["found_keys"].append({"type":"code","repo":repo_name,"file":file_path,"service":service,"key":key,"balance":bal,"info":info})
-                                print(f"  ✅ Created issue #{new_issue.number} for {repo_name}")
-                                time.sleep(1)
+                            issue_title = f"API Key Leak Detected in {file_path}"
+                            new_issue = code_repo.create_issue(title=issue_title, body=reply, labels=["security"])
+                            mark_code_replied(file_id, state)
+                            save_state(state)
+                            scan_results["replied_count"] += 1
+                            scan_results["found_keys"].append({"type":"code","repo":repo_name,"file":file_path,"service":service,"key":key,"balance":bal,"info":info})
+                            print(f"  Created issue #{new_issue.number} for {repo_name}")
+                            time.sleep(1)
                         except Exception as e:
                             scan_results["errors"].append(str(e))
-                            print(f"  ❌ Failed: {e}")
+                            print(f"  Failed: {e}")
                     else:
-                        print(f"  ❌ Invalid: {info}")
+                        print(f"  Invalid: {info}")
             time.sleep(0.5)
     except Exception as e:
         scan_results["errors"].append(str(e))
@@ -330,13 +309,7 @@ def check_and_reply():
     # ========== Scan Issues ==========
     print("\n--- Scanning issues ---")
     try:
-        issues = search_with_retry(
-            g.search_issues,
-            ISSUE_QUERY,
-            sort="created",
-            order="desc"
-        )[:30]
-        
+        issues = search_with_retry(g.search_issues, ISSUE_QUERY, sort="created", order="desc")[:30]
         total = len(issues)
         print(f"Found {total} issues to check")
         
@@ -372,6 +345,8 @@ def check_and_reply():
                     
                     line_num = None
                     line_content = ""
+                    loc = "unknown"
+                    
                     if key in title:
                         line_num = 1
                         line_content = title[:200]
@@ -392,8 +367,6 @@ def check_and_reply():
                                 line_content = l.strip()[:200]
                                 break
                         loc = "issue comment"
-                    else:
-                        loc = "unknown"
                     
                     valid, bal, info = verify_key(service, key)
                     if valid:
@@ -405,13 +378,13 @@ def check_and_reply():
                             save_state(state)
                             scan_results["replied_count"] += 1
                             scan_results["found_keys"].append({"type":"issue","number":num,"service":service,"key":key,"balance":bal,"info":info})
-                            print(f"  ✅ Replied to issue #{num}")
+                            print(f"  Replied to issue #{num}")
                             time.sleep(1)
                         except Exception as e:
                             scan_results["errors"].append(str(e))
-                            print(f"  ❌ Failed: {e}")
+                            print(f"  Failed: {e}")
                     else:
-                        print(f"  ❌ Invalid: {info}")
+                        print(f"  Invalid: {info}")
             time.sleep(0.5)
     except Exception as e:
         scan_results["errors"].append(str(e))
