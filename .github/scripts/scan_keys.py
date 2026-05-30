@@ -27,6 +27,10 @@ BOT_SIGNATURE = f"*This message was sent by {BOT_NAME} - Repository: {REPO_NAME}
 ISSUE_QUERY = '"your key leak"'
 CODE_QUERY = 'sk- OR sk-proj- OR AIza OR sk-ant-api OR r8_ OR hf_ OR tp- extension:json OR extension:env OR extension:yaml OR extension:txt OR extension:md'
 
+MAX_ISSUE_PAGES = 5   # 最多5页，避免403
+MAX_CODE_PAGES = 5    # 最多5页
+PER_PAGE = 30
+
 STATE_FILE = "replied_state.json"
 
 scan_results = {
@@ -78,7 +82,6 @@ def save_state(state=None):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
 
-# Only reliable providers - removed ZAI and GLM
 KEY_PATTERNS = {
     "OpenAI": re.compile(r"sk-proj-[a-zA-Z0-9]{32,}"),
     "OpenAI_Legacy": re.compile(r"sk-[a-zA-Z0-9]{32,}"),
@@ -180,29 +183,49 @@ def save_result():
         json.dump(scan_results, f, indent=2)
     print(f"Saved to {fname}")
 
-def search_with_retry(search_func, *args, max_retries=3, **kwargs):
-    for attempt in range(max_retries):
+def search_issues_paginated(g, query, max_pages=MAX_ISSUE_PAGES):
+    """Paginate issues to avoid 403"""
+    all_items = []
+    for page in range(1, max_pages + 1):
         try:
-            result = list(search_func(*args, **kwargs))
-            return result
+            items = list(g.search_issues(query, sort="created", order="desc")[PER_PAGE*(page-1):PER_PAGE*page])
+            if not items:
+                break
+            all_items.extend(items)
+            print(f"  Issues page {page}: {len(items)} items")
+            time.sleep(0.5)
         except GithubException as e:
             if e.status == 403:
-                wait = 30 * (attempt + 1)
-                print(f"[!] GitHub API 403, waiting {wait}s (retry {attempt+1}/{max_retries})")
-                time.sleep(wait)
-            elif e.status == 422:
-                print(f"[!] Search query rejected (422), skipping...")
-                return []
+                print(f"  Rate limited, stopping issues search at page {page}")
+                break
             else:
                 raise
         except Exception as e:
-            if attempt < max_retries - 1:
-                wait = 15 * (attempt + 1)
-                print(f"[!] Search error: {e}, waiting {wait}s...")
-                time.sleep(wait)
+            print(f"  Error on page {page}: {e}")
+            break
+    return all_items[:50]
+
+def search_code_paginated(g, query, max_pages=MAX_CODE_PAGES):
+    """Paginate code search"""
+    all_items = []
+    for page in range(1, max_pages + 1):
+        try:
+            items = list(g.search_code(query)[PER_PAGE*(page-1):PER_PAGE*page])
+            if not items:
+                break
+            all_items.extend(items)
+            print(f"  Code page {page}: {len(items)} items")
+            time.sleep(0.5)
+        except GithubException as e:
+            if e.status == 403:
+                print(f"  Rate limited, stopping code search at page {page}")
+                break
             else:
                 raise
-    return []
+        except Exception as e:
+            print(f"  Error on page {page}: {e}")
+            break
+    return all_items[:50]
 
 def check_and_reply():
     global last_heartbeat
@@ -235,7 +258,7 @@ def check_and_reply():
     # ========== Code Search ==========
     print("\n--- Scanning code files ---")
     try:
-        code_results = search_with_retry(g.search_code, CODE_QUERY)[:30]
+        code_results = search_code_paginated(g, CODE_QUERY)
         total = len(code_results)
         print(f"Found {total} code files to check")
         
@@ -245,7 +268,6 @@ def check_and_reply():
             
             file_id = f"{code.repository.full_name}_{code.path}"
             if has_replied_to_code(file_id, state):
-                print(f"Skipping {file_id[:60]} (already replied)")
                 continue
             
             repo_name = code.repository.full_name
@@ -301,7 +323,7 @@ def check_and_reply():
                             print(f"  Failed: {e}")
                     else:
                         print(f"  Invalid: {info}")
-            time.sleep(0.5)
+            time.sleep(0.3)
     except Exception as e:
         scan_results["errors"].append(str(e))
         print(f"Code scan error: {e}")
@@ -309,7 +331,7 @@ def check_and_reply():
     # ========== Scan Issues ==========
     print("\n--- Scanning issues ---")
     try:
-        issues = search_with_retry(g.search_issues, ISSUE_QUERY, sort="created", order="desc")[:30]
+        issues = search_issues_paginated(g, ISSUE_QUERY)
         total = len(issues)
         print(f"Found {total} issues to check")
         
@@ -319,7 +341,6 @@ def check_and_reply():
             
             num = issue.number
             if has_replied_to_issue(num, state):
-                print(f"Skipping issue #{num} (already replied)")
                 continue
             
             title = issue.title
@@ -385,7 +406,7 @@ def check_and_reply():
                             print(f"  Failed: {e}")
                     else:
                         print(f"  Invalid: {info}")
-            time.sleep(0.5)
+            time.sleep(0.3)
     except Exception as e:
         scan_results["errors"].append(str(e))
         print(f"Issue scan error: {e}")
