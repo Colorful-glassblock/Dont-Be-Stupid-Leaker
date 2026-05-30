@@ -8,15 +8,18 @@ import json
 import signal
 from datetime import datetime
 from typing import Tuple
-from github import Github, GithubException
+from github import Github, Auth, GithubException
 import requests
 
 # ========== Timeout Configuration ==========
-MAX_RUNTIME_SECONDS = 90 * 60  # 1.5 hours = 5400 seconds
-HEARTBEAT_INTERVAL = 300       # 5 minutes
+MAX_RUNTIME_SECONDS = 90 * 60
+HEARTBEAT_INTERVAL = 300
 
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 PAT_TOKEN = os.environ.get("PAT_TOKEN")
+if not PAT_TOKEN:
+    print("Error: PAT_TOKEN not set")
+    sys.exit(1)
+
 REPO_NAME = os.environ.get("GITHUB_REPOSITORY", "colorful-glassblock/Dont-Be-Stupid-Leaker")
 BOT_NAME = "LLMApiCheckBot"
 BOT_SIGNATURE = f"*This message was sent by {BOT_NAME} - Repository: {REPO_NAME}*"
@@ -25,7 +28,6 @@ ISSUE_QUERY = '"your key leak"'
 COMMIT_QUERY = 'sk- OR sk-proj- OR AIza OR sk-ant OR r8_ OR hf_ OR tp-'
 
 STATE_FILE = "replied_state.json"
-PROGRESS_FILE = "scan_progress.json"
 
 scan_results = {
     "scan_time": datetime.now().isoformat(),
@@ -37,35 +39,30 @@ scan_results = {
 start_time = time.time()
 last_heartbeat = start_time
 
-# ========== Signal Handler for Graceful Shutdown ==========
 def signal_handler(sig, frame):
-    elapsed = time.time() - start_time
-    print(f"\n[!] Received interrupt signal at {elapsed:.0f}s, saving state...")
+    print(f"\n[!] Interrupted, saving state...")
     save_state()
     save_result()
-    print("[!] State saved. Exiting.")
     sys.exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 def check_timeout():
-    """Check if max runtime exceeded, exit if so"""
     elapsed = time.time() - start_time
     if elapsed >= MAX_RUNTIME_SECONDS:
-        print(f"[!] Max runtime ({MAX_RUNTIME_SECONDS}s / 1.5h) reached. Saving and exiting.")
+        print(f"[!] Max runtime reached. Exiting.")
         save_state()
         save_result()
         sys.exit(0)
     return elapsed
 
 def heartbeat():
-    """Print heartbeat every HEARTBEAT_INTERVAL seconds"""
     global last_heartbeat
     now = time.time()
     if now - last_heartbeat >= HEARTBEAT_INTERVAL:
         elapsed = now - start_time
-        print(f"[❤️] Still alive... elapsed: {elapsed:.0f}s / {MAX_RUNTIME_SECONDS}s ({(elapsed/MAX_RUNTIME_SECONDS)*100:.1f}%)")
+        print(f"[❤️] Alive: {elapsed:.0f}s / {MAX_RUNTIME_SECONDS}s")
         last_heartbeat = now
 
 def load_state():
@@ -80,17 +77,6 @@ def save_state(state=None):
         state = load_state()
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
-
-def load_progress():
-    try:
-        with open(PROGRESS_FILE, "r") as f:
-            return json.load(f)
-    except:
-        return {"last_commit_index": 0, "last_issue_index": 0}
-
-def save_progress(progress):
-    with open(PROGRESS_FILE, "w") as f:
-        json.dump(progress, f)
 
 KEY_PATTERNS = {
     "OpenAI": re.compile(r"sk-proj-[a-zA-Z0-9]{32,}"),
@@ -196,36 +182,59 @@ def save_result():
         json.dump(scan_results, f, indent=2)
     print(f"Saved to {fname}")
 
+def search_with_retry(search_func, *args, max_retries=5, **kwargs):
+    for attempt in range(max_retries):
+        try:
+            result = list(search_func(*args, **kwargs))
+            return result
+        except GithubException as e:
+            if e.status == 403 and "rate limit" in str(e).lower():
+                wait = 60 * (attempt + 1)
+                print(f"[!] Rate limited, waiting {wait}s (retry {attempt+1}/{max_retries})")
+                time.sleep(wait)
+            else:
+                raise
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait = 30 * (attempt + 1)
+                print(f"[!] Search error: {e}, waiting {wait}s...")
+                time.sleep(wait)
+            else:
+                raise
+    return []
+
 def check_and_reply():
     global last_heartbeat
-    
-    if not PAT_TOKEN:
-        print("Error: PAT_TOKEN not set")
-        return
     
     print(f"Starting scan on {REPO_NAME}")
     print(f"Max runtime: {MAX_RUNTIME_SECONDS}s (1.5 hours)")
     
     state = load_state()
-    progress = load_progress()
     print(f"Loaded state: {len(state.get('replied_commits', []))} commits, {len(state.get('replied_issues', []))} issues already replied")
     
-    g_read = Github(GITHUB_TOKEN)
-    g_write = Github(PAT_TOKEN)
+    auth = Auth.Token(PAT_TOKEN)
+    g = Github(auth=auth)
+    
     try:
-        repo_read = g_read.get_repo(REPO_NAME)
-        repo_write = g_write.get_repo(REPO_NAME)
+        repo = g.get_repo(REPO_NAME)
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error accessing repo: {e}")
         return
+    
     processed = set()
     
     # Scan commits
     print("\n--- Scanning commits ---")
     try:
-        commits = list(g_read.search_commits(COMMIT_QUERY, sort="committer-date", order="desc"))[:50]
-        total_commits = len(commits)
-        print(f"Found {total_commits} commits to check")
+        commits = search_with_retry(
+            g.search_commits,
+            COMMIT_QUERY,
+            sort="committer-date",
+            order="desc"
+        )[:50]
+        
+        total = len(commits)
+        print(f"Found {total} commits to check")
         
         for idx, commit in enumerate(commits):
             heartbeat()
@@ -235,15 +244,16 @@ def check_and_reply():
             if has_replied_to_commit(sha, state):
                 print(f"Skipping commit {sha[:8]} (already replied)")
                 continue
+            
             msg = commit.commit.message
             title = msg.split('\n')[0]
             author = commit.author.login if commit.author else "unknown"
-            print(f"[{idx+1}/{total_commits}] Checking commit: {sha[:8]} by {author}")
+            print(f"[{idx+1}/{total}] Checking commit: {sha[:8]} by {author}")
             
             full_text = title + "\n" + msg
             diff = ""
             try:
-                files = repo_read.get_commit(sha).files
+                files = repo.get_commit(sha).files
                 for f in files:
                     if f.patch:
                         diff += f.patch + "\n"
@@ -279,7 +289,7 @@ def check_and_reply():
                                     break
                         reply = build_commit_reply(author, service, key, info, commit.html_url, loc, line_num, line_content, bal)
                         try:
-                            repo_write.get_commit(sha).create_comment(reply)
+                            repo.get_commit(sha).create_comment(reply)
                             mark_commit_replied(sha, state)
                             save_state(state)
                             scan_results["replied_count"] += 1
@@ -298,9 +308,15 @@ def check_and_reply():
     # Scan issues
     print("\n--- Scanning issues ---")
     try:
-        issues = list(g_read.search_issues(ISSUE_QUERY, sort="created", order="desc"))[:50]
-        total_issues = len(issues)
-        print(f"Found {total_issues} issues to check")
+        issues = search_with_retry(
+            g.search_issues,
+            ISSUE_QUERY,
+            sort="created",
+            order="desc"
+        )[:50]
+        
+        total = len(issues)
+        print(f"Found {total} issues to check")
         
         for idx, issue in enumerate(issues):
             heartbeat()
@@ -310,10 +326,11 @@ def check_and_reply():
             if has_replied_to_issue(num, state):
                 print(f"Skipping issue #{num} (already replied)")
                 continue
+            
             title = issue.title
             body = issue.body or ""
             author = issue.user.login
-            print(f"[{idx+1}/{total_issues}] Checking issue #{num} by {author}")
+            print(f"[{idx+1}/{total}] Checking issue #{num} by {author}")
             
             comments = ""
             try:
@@ -351,7 +368,7 @@ def check_and_reply():
                             loc = "issue comment"
                         reply = build_issue_reply(author, service, key, info, issue.html_url, loc, line_num, line_content, bal)
                         try:
-                            repo_write.get_issue(number=num).create_comment(reply)
+                            repo.get_issue(number=num).create_comment(reply)
                             mark_issue_replied(num, state)
                             save_state(state)
                             scan_results["replied_count"] += 1
