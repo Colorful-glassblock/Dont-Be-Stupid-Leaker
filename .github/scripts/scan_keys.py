@@ -24,8 +24,9 @@ REPO_NAME = os.environ.get("GITHUB_REPOSITORY", "Colorful-glassblock/Dont-Be-Stu
 BOT_NAME = "LLMApiCheckBot"
 BOT_SIGNATURE = f"*This message was sent by {BOT_NAME} - Repository: {REPO_NAME}*"
 
+# Search queries
 ISSUE_QUERY = '"your key leak"'
-COMMIT_QUERY = '"sk-" OR "sk-proj-" OR "AIza" OR "sk-ant-api" OR "tp-"'
+CODE_QUERY = 'sk- OR sk-proj- OR AIza OR sk-ant-api OR tp- extension:json OR extension:env OR extension:yaml OR extension:txt OR extension:md'
 
 STATE_FILE = "replied_state.json"
 
@@ -70,7 +71,7 @@ def load_state():
         with open(STATE_FILE, "r") as f:
             return json.load(f)
     except:
-        return {"replied_commits": [], "replied_issues": []}
+        return {"replied_codes": [], "replied_issues": []}
 
 def save_state(state=None):
     if state is None:
@@ -149,27 +150,27 @@ def verify_key(service, key):
     except Exception as e:
         return False, 0, f"Error: {str(e)[:50]}"
 
-def build_commit_reply(author, service, key, info, commit_url, location_type, line_num, line_content, balance):
+def build_code_reply(author, service, key, info, repo_url, file_path, line_num, line_content, balance):
     masked = key[:12] + "..." + key[-8:] if len(key) > 24 else key
-    loc = f"Location: {location_type}" + (f" (line {line_num})" if line_num else "")
-    return f"@{author} Your API key has been exposed in a commit!\n\n# Summary\nThis is a **{service}** API key in commit [{commit_url.split('/')[-1]}]({commit_url}).\n\n{loc}\nKey preview: `{masked}`\n\nVerification result: {info}\n\n---\n\n**What to do:**\n1. Revoke this key from {service} dashboard\n2. Generate a new key\n3. Remove from git history using BFG Repo Cleaner or git filter-branch\n4. Rotate other exposed secrets\n\n**Exposed code:**\n```\n{line_content[:300] if line_content else 'Content too long'}\n```\n\n---\n{BOT_SIGNATURE}"
+    loc = f"Location: {file_path}" + (f" (line {line_num})" if line_num else "")
+    return f"@{author} Your API key has been exposed in a code file!\n\n# Summary\nThis is a **{service}** API key found in [{repo_url}]({repo_url}).\n\n{loc}\nKey preview: `{masked}`\n\nVerification result: {info}\n\n---\n\n**What to do:**\n1. Revoke this key from {service} dashboard\n2. Generate a new key\n3. Remove the key from the file and force-push\n4. Rotate other exposed secrets\n\n**Exposed code:**\n```\n{line_content[:300] if line_content else 'Content too long'}\n```\n\n---\n{BOT_SIGNATURE}"
 
 def build_issue_reply(author, service, key, info, issue_url, location_type, line_num, line_content, balance):
     masked = key[:12] + "..." + key[-8:] if len(key) > 24 else key
     loc = f"Location: {location_type}" + (f" (line {line_num})" if line_num else "")
     return f"@{author} Your API key has been exposed in this issue!\n\n# Summary\nThis is a **{service}** API key in issue [#{issue_url.split('/')[-1]}]({issue_url}).\n\n{loc}\nKey preview: `{masked}`\n\nVerification result: {info}\n\n---\n\n**What to do:**\n1. Revoke this key from {service} dashboard\n2. Generate a new key\n3. Edit or delete the issue/comment containing the key\n4. Rotate other exposed secrets\n\n**Exposed content:**\n```\n{line_content[:300] if line_content else 'Content too long'}\n```\n\n---\n{BOT_SIGNATURE}"
 
-def has_replied_to_commit(commit_sha, state):
-    return commit_sha in state.get("replied_commits", [])
+def has_replied_to_code(file_id, state):
+    return file_id in state.get("replied_codes", [])
 
 def has_replied_to_issue(issue_id, state):
     return str(issue_id) in state.get("replied_issues", [])
 
-def mark_commit_replied(commit_sha, state):
-    if "replied_commits" not in state:
-        state["replied_commits"] = []
-    if commit_sha not in state["replied_commits"]:
-        state["replied_commits"].append(commit_sha)
+def mark_code_replied(file_id, state):
+    if "replied_codes" not in state:
+        state["replied_codes"] = []
+    if file_id not in state["replied_codes"]:
+        state["replied_codes"].append(file_id)
 
 def mark_issue_replied(issue_id, state):
     if "replied_issues" not in state:
@@ -214,18 +215,14 @@ def check_and_reply():
     print(f"Max runtime: {MAX_RUNTIME_SECONDS}s (1.5 hours)")
     
     state = load_state()
-    print(f"Loaded state: {len(state.get('replied_commits', []))} commits, {len(state.get('replied_issues', []))} issues already replied")
+    print(f"Loaded state: {len(state.get('replied_codes', []))} code files, {len(state.get('replied_issues', []))} issues already replied")
     
     auth = Auth.Token(PAT_TOKEN)
     g = Github(auth=auth)
     
-    # 验证 token
     try:
         user = g.get_user()
         print(f"Authenticated as: {user.login}")
-        # 修复 rate limit 获取方式
-        rate_limit = g.get_rate_limit()
-        print(f"Rate limit: {rate_limit.raw_data.get('rate', {}).get('remaining', 'N/A')}")
     except Exception as e:
         print(f"Auth error: {e}")
         return
@@ -239,79 +236,87 @@ def check_and_reply():
     
     processed = set()
     
-    # Scan commits
-    print("\n--- Scanning commits ---")
+    # ========== Code Search (代替 Commit Search) ==========
+    print("\n--- Scanning code files ---")
     try:
-        commits = search_with_retry(
-            g.search_commits,
-            COMMIT_QUERY,
-            sort="committer-date",
-            order="desc"
+        code_results = search_with_retry(
+            g.search_code,
+            CODE_QUERY
         )[:30]
         
-        total = len(commits)
-        print(f"Found {total} commits to check")
+        total = len(code_results)
+        print(f"Found {total} code files to check")
         
-        for idx, commit in enumerate(commits):
+        for idx, code in enumerate(code_results):
             heartbeat()
             check_timeout()
             
-            sha = commit.sha
-            if has_replied_to_commit(sha, state):
-                print(f"Skipping commit {sha[:8]} (already replied)")
+            file_id = f"{code.repository.full_name}_{code.path}"
+            if has_replied_to_code(file_id, state):
+                print(f"Skipping {file_id[:60]} (already replied)")
                 continue
             
-            msg = commit.commit.message
-            title = msg.split('\n')[0]
-            author = commit.author.login if commit.author else "unknown"
-            print(f"[{idx+1}/{total}] Checking commit: {sha[:8]} by {author}")
+            repo_name = code.repository.full_name
+            file_path = code.path
+            file_url = code.html_url
+            raw_url = code.download_url
             
-            full_text = title + "\n" + msg
-            diff = ""
+            author = code.repository.owner.login
+            
+            print(f"[{idx+1}/{total}] Checking {repo_name}/{file_path}")
+            
+            # 获取文件内容
+            content = ""
             try:
-                files = repo.get_commit(sha).files
-                for f in files:
-                    if f.patch:
-                        diff += f.patch + "\n"
-                full_text += "\n" + diff
+                resp = requests.get(raw_url, timeout=10)
+                if resp.status_code == 200:
+                    content = resp.text
             except Exception as e:
-                print(f"  Error getting diff: {e}")
+                print(f"  Error fetching file: {e}")
+                continue
             
+            # 提取 Key
             for service, pattern in KEY_PATTERNS.items():
-                for m in pattern.finditer(full_text):
+                for m in pattern.finditer(content):
                     key = m.group(0)
-                    uid = f"c_{sha}_{key[:16]}"
+                    uid = f"code_{file_id}_{key[:16]}"
                     if uid in processed:
                         continue
                     print(f"  Found {service} key: {key[:20]}...")
+                    
+                    # 找到行号
+                    line_num = None
+                    line_content = ""
+                    lines = content.split('\n')
+                    for i, line in enumerate(lines):
+                        if key in line:
+                            line_num = i + 1
+                            line_content = line.strip()[:300]
+                            break
+                    
                     valid, bal, info = verify_key(service, key)
                     if valid:
                         processed.add(uid)
-                        loc, line_num, line_content = "code diff", None, ""
-                        if key in title:
-                            loc, line_num, line_content = "commit title", 1, title[:200]
-                        elif key in msg:
-                            lines = msg.split('\n')
-                            for i, l in enumerate(lines):
-                                if key in l:
-                                    line_num, line_content = i+1, l.strip()[:200]
-                                    break
-                            loc = "commit message"
-                        elif key in diff:
-                            lines = diff.split('\n')
-                            for i, l in enumerate(lines):
-                                if key in l:
-                                    line_num, line_content = i+1, l.strip()[:200]
-                                    break
-                        reply = build_commit_reply(author, service, key, info, commit.html_url, loc, line_num, line_content, bal)
+                        reply = build_code_reply(author, service, key, info, file_url, file_path, line_num, line_content, bal)
                         try:
-                            repo.get_commit(sha).create_comment(reply)
-                            mark_commit_replied(sha, state)
-                            save_state(state)
-                            scan_results["replied_count"] += 1
-                            scan_results["found_keys"].append({"type":"commit","sha":sha,"service":service,"key":key,"balance":bal,"info":info})
-                            print(f"  ✅ Replied to commit {sha[:8]}")
-                            time.sleep(1)
+                            # 在代码文件的仓库创建 Issue 通知
+                            code_repo = g.get_repo(repo_name)
+                            issue_title = f"⚠️ API Key Leak Detected in {file_path}"
+                            issue_body = reply
+                            # 检查是否已有类似 issue
+                            existing = False
+                            for issue in code_repo.get_issues(state="open", labels=["security"]):
+                                if file_path in issue.title:
+                                    existing = True
+                                    break
+                            if not existing:
+                                new_issue = code_repo.create_issue(title=issue_title, body=issue_body, labels=["security"])
+                                mark_code_replied(file_id, state)
+                                save_state(state)
+                                scan_results["replied_count"] += 1
+                                scan_results["found_keys"].append({"type":"code","repo":repo_name,"file":file_path,"service":service,"key":key,"balance":bal,"info":info})
+                                print(f"  ✅ Created issue #{new_issue.number} for {repo_name}")
+                                time.sleep(1)
                         except Exception as e:
                             scan_results["errors"].append(str(e))
                             print(f"  ❌ Failed: {e}")
@@ -320,9 +325,9 @@ def check_and_reply():
             time.sleep(0.5)
     except Exception as e:
         scan_results["errors"].append(str(e))
-        print(f"Commit scan error: {e}")
+        print(f"Code scan error: {e}")
     
-    # Scan issues
+    # ========== Scan Issues ==========
     print("\n--- Scanning issues ---")
     try:
         issues = search_with_retry(
@@ -364,25 +369,35 @@ def check_and_reply():
                     if uid in processed:
                         continue
                     print(f"  Found {service} key: {key[:20]}...")
+                    
+                    line_num = None
+                    line_content = ""
+                    if key in title:
+                        line_num = 1
+                        line_content = title[:200]
+                        loc = "issue title"
+                    elif key in body:
+                        lines = body.split('\n')
+                        for i, l in enumerate(lines):
+                            if key in l:
+                                line_num = i + 1
+                                line_content = l.strip()[:200]
+                                break
+                        loc = "issue body"
+                    elif key in comments:
+                        lines = comments.split('\n')
+                        for i, l in enumerate(lines):
+                            if key in l:
+                                line_num = i + 1
+                                line_content = l.strip()[:200]
+                                break
+                        loc = "issue comment"
+                    else:
+                        loc = "unknown"
+                    
                     valid, bal, info = verify_key(service, key)
                     if valid:
                         processed.add(uid)
-                        loc, line_num, line_content = "issue body", None, ""
-                        if key in title:
-                            loc, line_num, line_content = "issue title", 1, title[:200]
-                        elif key in body:
-                            lines = body.split('\n')
-                            for i, l in enumerate(lines):
-                                if key in l:
-                                    line_num, line_content = i+1, l.strip()[:200]
-                                    break
-                        elif key in comments:
-                            lines = comments.split('\n')
-                            for i, l in enumerate(lines):
-                                if key in l:
-                                    line_num, line_content = i+1, l.strip()[:200]
-                                    break
-                            loc = "issue comment"
                         reply = build_issue_reply(author, service, key, info, issue.html_url, loc, line_num, line_content, bal)
                         try:
                             repo.get_issue(number=num).create_comment(reply)
