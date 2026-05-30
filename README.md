@@ -1,7 +1,5 @@
 Dont-Be-Stupid-Leaker
 
-https://readme-typing-svg.demolab.com?font=JetBrains+Mono&size=33&pause=1000&color=FF0000&center=true&vCenter=true&width=750&lines=Your+API+Key%3F+More+Like+Your+AP-I+CHEAP!;%E4%BD%A0%E7%9A%84Key%3F%E8%A2%AB%E8%96%85%E5%85%89%E4%BA%86QwQ;w+114514;0721...;Skill+Issue+%2B+You+Leak+Keys
-
 <p align="center">
   <a href="https://github.com/Colorful-glassblock/Dont-Be-Stupid-Leaker">
     <img src="https://readme-typing-svg.demolab.com?font=JetBrains+Mono&size=32&pause=1000&color=FF4444&center=true&vCenter=true&width=500&lines=LLMApiCheckBot;%E5%88%AB%E5%BD%93%E5%82%BB%E9%80%BC%E6%B3%84%E9%9C%B2%E8%80%85"/>
