@@ -20,11 +20,10 @@ if not PAT_TOKEN:
     print("Error: PAT_TOKEN not set")
     sys.exit(1)
 
-REPO_NAME = os.environ.get("GITHUB_REPOSITORY", "colorful-glassblock/Dont-Be-Stupid-Leaker")
+REPO_NAME = os.environ.get("GITHUB_REPOSITORY", "Colorful-glassblock/Dont-Be-Stupid-Leaker")
 BOT_NAME = "LLMApiCheckBot"
 BOT_SIGNATURE = f"*This message was sent by {BOT_NAME} - Repository: {REPO_NAME}*"
 
-# 使用更精准的搜索，减少 API 调用次数
 ISSUE_QUERY = '"your key leak"'
 COMMIT_QUERY = '"sk-" OR "sk-proj-" OR "AIza" OR "sk-ant-api" OR "tp-"'
 
@@ -185,7 +184,6 @@ def save_result():
     print(f"Saved to {fname}")
 
 def search_with_retry(search_func, *args, max_retries=3, **kwargs):
-    """Search with exponential backoff for rate limiting"""
     for attempt in range(max_retries):
         try:
             result = list(search_func(*args, **kwargs))
@@ -218,18 +216,18 @@ def check_and_reply():
     state = load_state()
     print(f"Loaded state: {len(state.get('replied_commits', []))} commits, {len(state.get('replied_issues', []))} issues already replied")
     
-    # 使用 PAT 认证
     auth = Auth.Token(PAT_TOKEN)
     g = Github(auth=auth)
     
-    # 验证 token 是否有效
+    # 验证 token
     try:
         user = g.get_user()
         print(f"Authenticated as: {user.login}")
+        # 修复 rate limit 获取方式
         rate_limit = g.get_rate_limit()
-        print(f"Rate limit: {rate_limit.core.remaining}/{rate_limit.core.limit}")
+        print(f"Rate limit: {rate_limit.raw_data.get('rate', {}).get('remaining', 'N/A')}")
     except Exception as e:
-        print(f"Auth failed: {e}")
+        print(f"Auth error: {e}")
         return
     
     try:
@@ -241,7 +239,7 @@ def check_and_reply():
     
     processed = set()
     
-    # Scan commits (减少数量，避免超限)
+    # Scan commits
     print("\n--- Scanning commits ---")
     try:
         commits = search_with_retry(
@@ -324,7 +322,7 @@ def check_and_reply():
         scan_results["errors"].append(str(e))
         print(f"Commit scan error: {e}")
     
-    # Scan issues (减少数量)
+    # Scan issues
     print("\n--- Scanning issues ---")
     try:
         issues = search_with_retry(
