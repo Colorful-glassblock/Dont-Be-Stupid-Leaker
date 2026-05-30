@@ -27,9 +27,9 @@ BOT_SIGNATURE = f"*This message was sent by {BOT_NAME} - Repository: {REPO_NAME}
 ISSUE_QUERY = '"your key leak"'
 CODE_QUERY = 'sk- OR sk-proj- OR AIza OR sk-ant-api OR r8_ OR hf_ OR tp- extension:json OR extension:env OR extension:yaml OR extension:txt OR extension:md'
 
-MAX_ISSUE_PAGES = 5   # 最多5页，避免403
-MAX_CODE_PAGES = 5    # 最多5页
-PER_PAGE = 30
+# 最多获取30条，不分页（避免403）
+MAX_ISSUES = 30
+MAX_CODE_FILES = 30
 
 STATE_FILE = "replied_state.json"
 
@@ -82,6 +82,7 @@ def save_state(state=None):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
 
+# Reliable providers - Cohere removed
 KEY_PATTERNS = {
     "OpenAI": re.compile(r"sk-proj-[a-zA-Z0-9]{32,}"),
     "OpenAI_Legacy": re.compile(r"sk-[a-zA-Z0-9]{32,}"),
@@ -89,7 +90,6 @@ KEY_PATTERNS = {
     "DeepSeek": re.compile(r"sk-[a-zA-Z0-9]{32,}"),
     "Gemini": re.compile(r"AIza[0-9A-Za-z\-_]{35}"),
     "Anthropic": re.compile(r"sk-ant-api[0-9A-Za-z\-_]{40,}"),
-    "Cohere": re.compile(r"[a-zA-Z0-9]{40}"),
     "Replicate": re.compile(r"r8_[a-zA-Z0-9]{32,}"),
     "HuggingFace": re.compile(r"hf_[a-zA-Z0-9]{30,}"),
     "MiMo": re.compile(r"tp-[a-zA-Z0-9]{10,}"),
@@ -123,7 +123,6 @@ VERIFIERS = {
     "DeepSeek": {"url": "https://api.deepseek.com/user/balance", "headers": lambda k: {"Authorization": f"Bearer {k}", "Accept": "application/json"}, "method": "GET", "parse": _parse_deepseek},
     "Gemini": {"url": lambda k: f"https://generativelanguage.googleapis.com/v1/models?key={k}", "headers": lambda k: {}, "method": "GET", "parse": lambda c, d: (c == 200, 0, "Valid")},
     "Anthropic": {"url": "https://api.anthropic.com/v1/messages", "headers": lambda k: {"x-api-key": k, "anthropic-version": "2023-06-01", "Content-Type": "application/json"}, "method": "POST", "body": lambda: json.dumps({"model": "claude-3-haiku-20240307", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}).encode(), "parse": lambda c, d: (c == 200, 0, "Valid")},
-    "Cohere": {"url": "https://api.cohere.ai/v1/models", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": lambda c, d: (c == 200, 0, "Valid")},
     "Replicate": {"url": "https://api.replicate.com/v1/account", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": lambda c, d: (c == 200, 0, "Valid")},
     "HuggingFace": {"url": "https://huggingface.co/api/whoami", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": lambda c, d: (c == 200, 0, "Valid")},
     "MiMo": {"url": "https://token-plan-cn.xiaomimimo.com/v1/models", "headers": lambda k: {"Authorization": f"Bearer {k}", "X-Plan-Type": "token-plan"}, "method": "GET", "parse": _parse_mimo},
@@ -183,50 +182,6 @@ def save_result():
         json.dump(scan_results, f, indent=2)
     print(f"Saved to {fname}")
 
-def search_issues_paginated(g, query, max_pages=MAX_ISSUE_PAGES):
-    """Paginate issues to avoid 403"""
-    all_items = []
-    for page in range(1, max_pages + 1):
-        try:
-            items = list(g.search_issues(query, sort="created", order="desc")[PER_PAGE*(page-1):PER_PAGE*page])
-            if not items:
-                break
-            all_items.extend(items)
-            print(f"  Issues page {page}: {len(items)} items")
-            time.sleep(0.5)
-        except GithubException as e:
-            if e.status == 403:
-                print(f"  Rate limited, stopping issues search at page {page}")
-                break
-            else:
-                raise
-        except Exception as e:
-            print(f"  Error on page {page}: {e}")
-            break
-    return all_items[:50]
-
-def search_code_paginated(g, query, max_pages=MAX_CODE_PAGES):
-    """Paginate code search"""
-    all_items = []
-    for page in range(1, max_pages + 1):
-        try:
-            items = list(g.search_code(query)[PER_PAGE*(page-1):PER_PAGE*page])
-            if not items:
-                break
-            all_items.extend(items)
-            print(f"  Code page {page}: {len(items)} items")
-            time.sleep(0.5)
-        except GithubException as e:
-            if e.status == 403:
-                print(f"  Rate limited, stopping code search at page {page}")
-                break
-            else:
-                raise
-        except Exception as e:
-            print(f"  Error on page {page}: {e}")
-            break
-    return all_items[:50]
-
 def check_and_reply():
     global last_heartbeat
     
@@ -255,10 +210,10 @@ def check_and_reply():
     
     processed = set()
     
-    # ========== Code Search ==========
+    # ========== Code Search (直接取前30条，不分页) ==========
     print("\n--- Scanning code files ---")
     try:
-        code_results = search_code_paginated(g, CODE_QUERY)
+        code_results = list(g.search_code(CODE_QUERY))[:MAX_CODE_FILES]
         total = len(code_results)
         print(f"Found {total} code files to check")
         
@@ -328,10 +283,10 @@ def check_and_reply():
         scan_results["errors"].append(str(e))
         print(f"Code scan error: {e}")
     
-    # ========== Scan Issues ==========
+    # ========== Scan Issues (直接取前30条，不分页) ==========
     print("\n--- Scanning issues ---")
     try:
-        issues = search_issues_paginated(g, ISSUE_QUERY)
+        issues = list(g.search_issues(ISSUE_QUERY, sort="created", order="desc"))[:MAX_ISSUES]
         total = len(issues)
         print(f"Found {total} issues to check")
         
