@@ -11,7 +11,7 @@ from typing import Tuple
 from github import Github, Auth, GithubException
 import requests
 
-# ========== Timeout Configuration ==========
+# ========== Configuration ==========
 MAX_RUNTIME_SECONDS = 90 * 60
 HEARTBEAT_INTERVAL = 300
 
@@ -24,8 +24,9 @@ REPO_NAME = os.environ.get("GITHUB_REPOSITORY", "colorful-glassblock/Dont-Be-Stu
 BOT_NAME = "LLMApiCheckBot"
 BOT_SIGNATURE = f"*This message was sent by {BOT_NAME} - Repository: {REPO_NAME}*"
 
+# 使用更精准的搜索，减少 API 调用次数
 ISSUE_QUERY = '"your key leak"'
-COMMIT_QUERY = 'sk- OR sk-proj- OR AIza OR sk-ant OR r8_ OR hf_ OR tp-'
+COMMIT_QUERY = '"sk-" OR "sk-proj-" OR "AIza" OR "sk-ant-api" OR "tp-"'
 
 STATE_FILE = "replied_state.json"
 
@@ -80,6 +81,7 @@ def save_state(state=None):
 
 KEY_PATTERNS = {
     "OpenAI": re.compile(r"sk-proj-[a-zA-Z0-9]{32,}"),
+    "OpenAI_Legacy": re.compile(r"sk-[a-zA-Z0-9]{32,}"),
     "OpenRouter": re.compile(r"sk-or-v1-[a-zA-Z0-9]{50,}"),
     "DeepSeek": re.compile(r"sk-[a-zA-Z0-9]{32,}"),
     "Gemini": re.compile(r"AIza[0-9A-Za-z\-_]{35}"),
@@ -182,21 +184,25 @@ def save_result():
         json.dump(scan_results, f, indent=2)
     print(f"Saved to {fname}")
 
-def search_with_retry(search_func, *args, max_retries=5, **kwargs):
+def search_with_retry(search_func, *args, max_retries=3, **kwargs):
+    """Search with exponential backoff for rate limiting"""
     for attempt in range(max_retries):
         try:
             result = list(search_func(*args, **kwargs))
             return result
         except GithubException as e:
-            if e.status == 403 and "rate limit" in str(e).lower():
-                wait = 60 * (attempt + 1)
-                print(f"[!] Rate limited, waiting {wait}s (retry {attempt+1}/{max_retries})")
+            if e.status == 403:
+                wait = 30 * (attempt + 1)
+                print(f"[!] GitHub API 403, waiting {wait}s (retry {attempt+1}/{max_retries})")
                 time.sleep(wait)
+            elif e.status == 422:
+                print(f"[!] Search query rejected (422), skipping...")
+                return []
             else:
                 raise
         except Exception as e:
             if attempt < max_retries - 1:
-                wait = 30 * (attempt + 1)
+                wait = 15 * (attempt + 1)
                 print(f"[!] Search error: {e}, waiting {wait}s...")
                 time.sleep(wait)
             else:
@@ -212,18 +218,30 @@ def check_and_reply():
     state = load_state()
     print(f"Loaded state: {len(state.get('replied_commits', []))} commits, {len(state.get('replied_issues', []))} issues already replied")
     
+    # 使用 PAT 认证
     auth = Auth.Token(PAT_TOKEN)
     g = Github(auth=auth)
     
+    # 验证 token 是否有效
+    try:
+        user = g.get_user()
+        print(f"Authenticated as: {user.login}")
+        rate_limit = g.get_rate_limit()
+        print(f"Rate limit: {rate_limit.core.remaining}/{rate_limit.core.limit}")
+    except Exception as e:
+        print(f"Auth failed: {e}")
+        return
+    
     try:
         repo = g.get_repo(REPO_NAME)
+        print(f"Repository: {repo.full_name}")
     except Exception as e:
         print(f"Error accessing repo: {e}")
         return
     
     processed = set()
     
-    # Scan commits
+    # Scan commits (减少数量，避免超限)
     print("\n--- Scanning commits ---")
     try:
         commits = search_with_retry(
@@ -231,7 +249,7 @@ def check_and_reply():
             COMMIT_QUERY,
             sort="committer-date",
             order="desc"
-        )[:50]
+        )[:30]
         
         total = len(commits)
         print(f"Found {total} commits to check")
@@ -294,18 +312,19 @@ def check_and_reply():
                             save_state(state)
                             scan_results["replied_count"] += 1
                             scan_results["found_keys"].append({"type":"commit","sha":sha,"service":service,"key":key,"balance":bal,"info":info})
-                            print(f"  Replied to commit {sha[:8]}")
+                            print(f"  ✅ Replied to commit {sha[:8]}")
                             time.sleep(1)
                         except Exception as e:
                             scan_results["errors"].append(str(e))
+                            print(f"  ❌ Failed: {e}")
                     else:
-                        print(f"  Invalid: {info}")
-            time.sleep(0.3)
+                        print(f"  ❌ Invalid: {info}")
+            time.sleep(0.5)
     except Exception as e:
         scan_results["errors"].append(str(e))
         print(f"Commit scan error: {e}")
     
-    # Scan issues
+    # Scan issues (减少数量)
     print("\n--- Scanning issues ---")
     try:
         issues = search_with_retry(
@@ -313,7 +332,7 @@ def check_and_reply():
             ISSUE_QUERY,
             sort="created",
             order="desc"
-        )[:50]
+        )[:30]
         
         total = len(issues)
         print(f"Found {total} issues to check")
@@ -373,13 +392,14 @@ def check_and_reply():
                             save_state(state)
                             scan_results["replied_count"] += 1
                             scan_results["found_keys"].append({"type":"issue","number":num,"service":service,"key":key,"balance":bal,"info":info})
-                            print(f"  Replied to issue #{num}")
+                            print(f"  ✅ Replied to issue #{num}")
                             time.sleep(1)
                         except Exception as e:
                             scan_results["errors"].append(str(e))
+                            print(f"  ❌ Failed: {e}")
                     else:
-                        print(f"  Invalid: {info}")
-            time.sleep(0.3)
+                        print(f"  ❌ Invalid: {info}")
+            time.sleep(0.5)
     except Exception as e:
         scan_results["errors"].append(str(e))
         print(f"Issue scan error: {e}")
