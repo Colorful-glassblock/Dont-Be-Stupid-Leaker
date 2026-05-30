@@ -27,7 +27,6 @@ BOT_SIGNATURE = f"*This message was sent by {BOT_NAME} - Repository: {REPO_NAME}
 ISSUE_QUERY = '"your key leak"'
 CODE_QUERY = 'sk- OR sk-proj- OR AIza OR sk-ant-api OR r8_ OR hf_ OR tp- extension:json OR extension:env OR extension:yaml OR extension:txt OR extension:md'
 
-# 最多获取30条，不分页（避免403）
 MAX_ISSUES = 30
 MAX_CODE_FILES = 30
 
@@ -82,7 +81,6 @@ def save_state(state=None):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
 
-# Reliable providers - Cohere removed
 KEY_PATTERNS = {
     "OpenAI": re.compile(r"sk-proj-[a-zA-Z0-9]{32,}"),
     "OpenAI_Legacy": re.compile(r"sk-[a-zA-Z0-9]{32,}"),
@@ -184,55 +182,55 @@ def save_result():
 
 def check_and_reply():
     global last_heartbeat
-    
+
     print(f"Starting scan on {REPO_NAME}")
     print(f"Max runtime: {MAX_RUNTIME_SECONDS}s (1.5 hours)")
-    
+
     state = load_state()
     print(f"Loaded state: {len(state.get('replied_codes', []))} code files, {len(state.get('replied_issues', []))} issues already replied")
-    
+
     auth = Auth.Token(PAT_TOKEN)
     g = Github(auth=auth)
-    
+
     try:
         user = g.get_user()
         print(f"Authenticated as: {user.login}")
     except Exception as e:
         print(f"Auth error: {e}")
         return
-    
+
     try:
         repo = g.get_repo(REPO_NAME)
         print(f"Repository: {repo.full_name}")
     except Exception as e:
         print(f"Error accessing repo: {e}")
         return
-    
+
     processed = set()
-    
-    # ========== Code Search (直接取前30条，不分页) ==========
+
+    # Code Search
     print("\n--- Scanning code files ---")
     try:
         code_results = list(g.search_code(CODE_QUERY))[:MAX_CODE_FILES]
         total = len(code_results)
         print(f"Found {total} code files to check")
-        
+
         for idx, code in enumerate(code_results):
             heartbeat()
             check_timeout()
-            
+
             file_id = f"{code.repository.full_name}_{code.path}"
             if has_replied_to_code(file_id, state):
                 continue
-            
+
             repo_name = code.repository.full_name
             file_path = code.path
             file_url = code.html_url
             raw_url = code.download_url
             author = code.repository.owner.login
-            
+
             print(f"[{idx+1}/{total}] Checking {repo_name}/{file_path}")
-            
+
             content = ""
             try:
                 resp = requests.get(raw_url, timeout=10)
@@ -241,7 +239,7 @@ def check_and_reply():
             except Exception as e:
                 print(f"  Error fetching file: {e}")
                 continue
-            
+
             for service, pattern in KEY_PATTERNS.items():
                 for m in pattern.finditer(content):
                     key = m.group(0)
@@ -249,7 +247,7 @@ def check_and_reply():
                     if uid in processed:
                         continue
                     print(f"  Found {service} key: {key[:20]}...")
-                    
+
                     line_num = None
                     line_content = ""
                     lines = content.split('\n')
@@ -258,7 +256,7 @@ def check_and_reply():
                             line_num = i + 1
                             line_content = line.strip()[:300]
                             break
-                    
+
                     valid, bal, info = verify_key(service, key)
                     if valid:
                         processed.add(uid)
@@ -282,34 +280,34 @@ def check_and_reply():
     except Exception as e:
         scan_results["errors"].append(str(e))
         print(f"Code scan error: {e}")
-    
-    # ========== Scan Issues (直接取前30条，不分页) ==========
+
+    # Issues Search
     print("\n--- Scanning issues ---")
     try:
         issues = list(g.search_issues(ISSUE_QUERY, sort="created", order="desc"))[:MAX_ISSUES]
         total = len(issues)
         print(f"Found {total} issues to check")
-        
+
         for idx, issue in enumerate(issues):
             heartbeat()
             check_timeout()
-            
+
             num = issue.number
             if has_replied_to_issue(num, state):
                 continue
-            
+
             title = issue.title
             body = issue.body or ""
             author = issue.user.login
             print(f"[{idx+1}/{total}] Checking issue #{num} by {author}")
-            
+
             comments = ""
             try:
                 for c in issue.get_comments():
                     comments += f"\n[{c.user.login}]: {c.body or ''}"
             except Exception as e:
                 print(f"  Error getting comments: {e}")
-            
+
             full_text = f"{title}\n{body}\n{comments}"
             for service, pattern in KEY_PATTERNS.items():
                 for m in pattern.finditer(full_text):
@@ -318,11 +316,11 @@ def check_and_reply():
                     if uid in processed:
                         continue
                     print(f"  Found {service} key: {key[:20]}...")
-                    
+
                     line_num = None
                     line_content = ""
                     loc = "unknown"
-                    
+
                     if key in title:
                         line_num = 1
                         line_content = title[:200]
@@ -343,7 +341,7 @@ def check_and_reply():
                                 line_content = l.strip()[:200]
                                 break
                         loc = "issue comment"
-                    
+
                     valid, bal, info = verify_key(service, key)
                     if valid:
                         processed.add(uid)
@@ -365,7 +363,7 @@ def check_and_reply():
     except Exception as e:
         scan_results["errors"].append(str(e))
         print(f"Issue scan error: {e}")
-    
+
     elapsed = time.time() - start_time
     print(f"\nScan completed in {elapsed:.0f}s")
     print(f"Found {len(scan_results['found_keys'])} new valid keys, replied to {scan_results['replied_count']} items.")
