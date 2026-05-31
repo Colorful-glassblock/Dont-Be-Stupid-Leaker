@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-API Key Leak Scanner - Stable Version
+API Key Leak Scanner - Detailed Log Version
 Supports: GitHub App + PAT fallback, OpenRouter, sk-proj-, 1.5h timeout
 """
 
@@ -27,10 +27,10 @@ MAX_RUNTIME_SECONDS = 90 * 60  # 1.5 hours
 HEARTBEAT_INTERVAL = 300
 REQUEST_TIMEOUT = 15
 PER_PAGE = 30
-MAX_PAGES = 50                # 增加到50页，不会过早停止
+MAX_PAGES = 50
 SEARCH_WORKERS = 3
 VERIFY_WORKERS = 30
-BATCH_SIZE = 50
+BATCH_SIZE = 30  # 每30个Key触发一次验证
 
 # GitHub App 配置 (从环境变量读取)
 APP_ID = os.environ.get("APP_ID")
@@ -78,73 +78,74 @@ KEY_PATTERNS = {
     "MiMo": re.compile(r"tp-[a-zA-Z0-9]{10,}"),
 }
 
-# ========== 增强验证机制 ==========
-def _parse_openai(code, data):
+# ========== 验证函数 ==========
+def _parse_deepseek(code, data):
     if code != 200:
         return False, 0, f"HTTP {code}"
     if not isinstance(data, dict):
         return False, 0, "Invalid response"
-    models = data.get("data", [])
-    if models and len(models) > 0:
-        return True, 0, "Valid OpenAI key"
-    return False, 0, "Invalid (no models)"
+    if data.get("is_available", False):
+        cny = sum(float(i.get("total_balance", 0)) for i in data.get("balance_infos", []) if i.get("currency") == "CNY")
+        usd = sum(float(i.get("total_balance", 0)) for i in data.get("balance_infos", []) if i.get("currency") == "USD")
+        info = f"💰 CNY: {cny:.2f}, USD: {usd:.2f}" if cny or usd else "Valid (no balance)"
+        return True, cny + usd * 7.2, info
+    return False, 0, "Invalid or expired"
+
+def _parse_openai(code, data):
+    if code == 200:
+        return True, 0, "Valid"
+    if code == 401:
+        return False, 0, "Invalid key"
+    if code == 429:
+        return False, 0, "Rate limited"
+    return False, 0, f"HTTP {code}"
 
 def _parse_openrouter(code, data):
     if code == 200:
+        credits = 0
         if isinstance(data, dict):
             credits = data.get("credits", 0)
-            if credits:
-                return True, float(credits), f"Credits: {credits}"
-        return True, 0, "Valid OpenRouter key"
-    elif code == 401:
-        return False, 0, "Invalid OpenRouter key"
-    else:
-        return False, 0, f"HTTP {code}"
-
-def _parse_deepseek(code, data):
-    if code != 200 or not isinstance(data, dict) or not data.get("is_available"):
-        return False, 0, "Invalid or expired"
-    cny = sum(float(i.get("total_balance", 0)) for i in data.get("balance_infos", []) if i.get("currency") == "CNY")
-    usd = sum(float(i.get("total_balance", 0)) for i in data.get("balance_infos", []) if i.get("currency") == "USD")
-    total = cny + usd * 7.2
-    info = f"💰 CNY: {cny:.2f}, USD: {usd:.2f}" if cny or usd else "Valid (no balance)"
-    return True, total, info
+        info = f"💰 Credits: {credits}" if credits > 0 else "Valid"
+        return True, float(credits), info
+    return False, 0, f"HTTP {code}"
 
 def _parse_gemini(code, data):
-    if code == 200 and isinstance(data, dict):
-        models = data.get("models", [])
-        if models and len(models) > 0:
-            return True, 0, "Valid Gemini key"
-    return False, 0, "Invalid"
+    if code == 200:
+        return True, 0, "Valid"
+    if code == 400:
+        return False, 0, "Invalid format"
+    return False, 0, f"HTTP {code}"
 
 def _parse_anthropic(code, data):
     if code == 200:
-        return True, 0, "Valid Anthropic key"
+        return True, 0, "Valid"
+    if code == 400:
+        return True, 0, "Possibly valid (request error)"
     return False, 0, f"HTTP {code}"
 
 def _parse_cohere(code, data):
-    if code == 200 and isinstance(data, dict):
-        models = data.get("models", [])
-        if models and len(models) > 0:
-            return True, 0, "Valid Cohere key"
-    return False, 0, "Invalid"
+    if code == 200:
+        return True, 0, "Valid"
+    return False, 0, f"HTTP {code}"
 
 def _parse_replicate(code, data):
     if code == 200:
-        return True, 0, "Valid Replicate key"
+        return True, 0, "Valid"
     return False, 0, f"HTTP {code}"
 
 def _parse_huggingface(code, data):
     if code == 200:
-        return True, 0, "Valid HuggingFace key"
+        return True, 0, "Valid"
     return False, 0, f"HTTP {code}"
 
 def _parse_mimo(code, data):
-    if code == 200 and isinstance(data, dict):
-        balance = float(data.get("balance", data.get("credit", 0)))
-        info = f"💰 Balance: {balance}" if balance > 0 else "Valid (no balance)"
+    if code == 200:
+        balance = 0
+        if isinstance(data, dict):
+            balance = float(data.get("balance", data.get("credit", 0)))
+        info = f"💰 Balance: {balance}" if balance > 0 else "Valid"
         return True, balance, info
-    return False, 0, "Invalid"
+    return False, 0, f"HTTP {code}"
 
 VERIFIERS = {
     "OpenAI": {"url": "https://api.openai.com/v1/models", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_openai},
@@ -159,7 +160,7 @@ VERIFIERS = {
     "MiMo": {"url": "https://token-plan-cn.xiaomimimo.com/v1/models", "headers": lambda k: {"Authorization": f"Bearer {k}", "X-Plan-Type": "token-plan"}, "method": "GET", "parse": _parse_mimo},
 }
 
-# ========== GitHub 认证 (App优先，回退到PAT) ==========
+# ========== GitHub 认证 ==========
 def get_github_client():
     token = None
     
@@ -254,40 +255,22 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 # ========== 回复模板 ==========
-def build_reply(service, key, info, source_url, source_type):
+def build_reply(author, service, key, info, source_url, source_type):
     masked = key[:12] + "..." + key[-8:] if len(key) > 24 else key
-    return f"""🔴 **API Key Leak Detected!**
+    return f"@{author} Your API key has been exposed!\n\n# Summary\nThis is a **{service}** API key found in {source_type}: [{source_url}]({source_url}).\n\nKey preview: `{masked}`\n\nVerification result: {info}\n\n---\n\n**What to do:**\n1. Revoke this key from {service} dashboard\n2. Generate a new key\n3. Remove the exposed key\n4. Rotate other exposed secrets\n\n---\n{BOT_SIGNATURE}"
 
-@{source_type.split('_')[0]} Your API key has been exposed in this {source_type}.
-
-**Service:** `{service}`
-**Key preview:** `{masked}`
-**Status:** {info}
-
-⚠️ **Immediate Actions Required:**
-1. Revoke this key immediately from your {service} dashboard
-2. Generate a new key
-3. Remove the exposed key from git history
-4. Rotate any other secrets that may be compromised
-
-📍 **Source:** {source_url}
-
----
-{BOT_SIGNATURE}"""
-
-# ========== 批量验证 ==========
+# ========== 验证批次（每条都打印） ==========
 def verify_batch(worker_id, batch):
     if not batch:
         return
-    safe_print(f"[Worker-{worker_id}] Verifying batch: {len(batch)} keys")
+    safe_print(f"\n[Worker-{worker_id}] 🔍 Verifying {len(batch)} keys...")
     
     def verify_one(key_info):
-        key, service, source_url, source_type = key_info
+        key, service, source_url, source_type, author = key_info
         verifier = VERIFIERS.get(service)
         if not verifier:
-            return None
+            return (key, service, False, 0, "Unsupported", source_url, source_type, author)
         try:
-            check_timeout()
             url = verifier["url"](key) if callable(verifier["url"]) else verifier["url"]
             headers = verifier["headers"](key)
             headers["User-Agent"] = "KeyScanner"
@@ -299,42 +282,37 @@ def verify_batch(worker_id, batch):
             else:
                 resp = requests.post(url, headers=headers, data=body, timeout=8)
             valid, balance, info = verifier["parse"](resp.status_code, resp.json() if resp.text else None)
-            if valid:
-                return (key, service, balance, info, source_url, source_type, datetime.now())
-        except:
-            pass
-        return None
+            return (key, service, valid, balance, info, source_url, source_type, author)
+        except Exception as e:
+            return (key, service, False, 0, f"Error: {str(e)[:30]}", source_url, source_type, author)
     
-    results = []
     with ThreadPoolExecutor(max_workers=VERIFY_WORKERS) as executor:
         futures = [executor.submit(verify_one, ki) for ki in batch]
         for future in as_completed(futures):
             try:
-                result = future.result(timeout=15)
-                if result:
-                    results.append(result)
-                    # 立即处理找到的 Key
-                    key, service, balance, info, source_url, source_type, ts = result
+                key, service, valid, balance, info, source_url, source_type, author = future.result(timeout=15)
+                if valid:
+                    print(f"  ✅ [{service}] {key[:25]}... -> {info}")
                     with valid_lock:
-                        found_valid_keys.append(result)
-                    print(f"\n{'='*60}")
-                    print(f"🎉 VALID KEY FOUND! [{service}]")
-                    print(f"   Key: {key}")
-                    print(f"   Source: {source_url[:80]}")
-                    print(f"   Status: {info}")
-                    print(f"{'='*60}\n")
+                        found_valid_keys.append((key, service, balance, info, source_url, source_type, datetime.now()))
                     with open("valid_keys_realtime.txt", "a") as f:
-                        f.write(f"{ts.strftime('%Y-%m-%d %H:%M:%S')} | {service} | {key} | {info} | {source_url}\n")
-            except:
-                pass
-    
-    safe_print(f"[Worker-{worker_id}] Batch done: {len(results)} valid keys found")
+                        f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | {service} | {key} | {info} | {source_url}\n")
+                    # 可选：回复
+                    # try:
+                    #     reply = build_reply(author, service, key, info, source_url, source_type)
+                    #     # 回复逻辑...
+                    # except:
+                    #     pass
+                else:
+                    print(f"  ❌ [{service}] {key[:25]}... -> {info}")
+            except Exception as e:
+                print(f"  ❌ Exception: {e}")
 
-def add_key_to_pending(worker_id, key, service, source_url, source_type):
+def add_key_to_pending(worker_id, key, service, source_url, source_type, author):
     if worker_id not in batch_locks:
         batch_locks[worker_id] = Lock()
     with batch_locks[worker_id]:
-        pending_batches[worker_id].append((key, service, source_url, source_type))
+        pending_batches[worker_id].append((key, service, source_url, source_type, author))
         pending_count[worker_id] += 1
         if pending_count[worker_id] >= BATCH_SIZE:
             batch = pending_batches[worker_id].copy()
@@ -344,33 +322,60 @@ def add_key_to_pending(worker_id, key, service, source_url, source_type):
             executor.submit(verify_batch, worker_id, batch)
             executor.shutdown(wait=False)
 
-def extract_and_queue(text, source_url, source_type, worker_id):
+def extract_and_queue(text, source_url, source_type, worker_id, author):
     for service, pattern in KEY_PATTERNS.items():
         for match in pattern.finditer(text):
             key = match.group(0)
+            # 简单去重
             with valid_lock:
                 if any(key == k for k, _, _, _, _, _, _ in found_valid_keys):
                     continue
-            add_key_to_pending(worker_id, key, service, source_url, source_type)
+            add_key_to_pending(worker_id, key, service, source_url, source_type, author)
 
 def process_item(item, item_type, worker_id):
     if item_type == "issue":
         url = item.get("html_url", "")
         title = item.get("title", "")
         body = item.get("body", "") or ""
+        author = item.get("user", {}).get("login", "unknown")
         full_text = title + "\n" + body
+        # 获取评论
+        try:
+            comments_url = item.get("comments_url", "")
+            if comments_url:
+                code, data = _http_request(comments_url, headers=_gh_headers(), timeout=10)
+                if code == 200 and isinstance(data, list):
+                    for comment in data:
+                        full_text += f"\n{comment.get('body', '')}"
+        except:
+            pass
     else:
         url = item.get("html_url", "")
         message = item.get("commit", {}).get("message", "")
+        author = item.get("author", {}).get("login", "unknown") if item.get("author") else "unknown"
         full_text = message
-    key_count = sum(len(pattern.findall(full_text)) for pattern in KEY_PATTERNS.values())
-    if key_count > 50:
-        return
-    extract_and_queue(full_text, url, f"{item_type}_body", worker_id)
+        # 获取 diff
+        try:
+            diff_url = url.replace("github.com", "api.github.com/repos")
+            diff_url = diff_url.replace("/commit/", "/commits/")
+            code, data = _http_request(diff_url, headers=_gh_headers(), timeout=10)
+            if code == 200 and isinstance(data, dict):
+                for f in data.get("files", []):
+                    patch = f.get("patch", "")
+                    if patch:
+                        full_text += "\n" + patch
+        except:
+            pass
+    
+    # 限制文本长度避免过大
+    if len(full_text) > 50000:
+        full_text = full_text[:50000]
+    
+    extract_and_queue(full_text, url, item_type, worker_id, author)
 
-# ========== 搜索 Worker（放宽限制版） ==========
+# ========== 搜索 Worker ==========
 def search_worker(worker_id, search_type, start_page):
-    safe_print(f"[Worker-{worker_id}] Starting {search_type} scan from page {start_page}")
+    safe_print(f"\n[Worker-{worker_id}] 🚀 Starting {search_type} scan from page {start_page}")
     query = ISSUE_QUERY if search_type == "issue" else COMMIT_QUERY
     api_path = "issues" if search_type == "issue" else "commits"
     encoded = urllib.parse.quote(query)
@@ -387,7 +392,7 @@ def search_worker(worker_id, search_type, start_page):
             code, data = _http_request(url, headers=_gh_headers(), timeout=REQUEST_TIMEOUT)
             
             if code == 403:
-                safe_print(f"[Worker-{worker_id}] {search_type} page {page}: HTTP 403, waiting 60s...")
+                safe_print(f"[Worker-{worker_id}] ⚠️ {search_type} page {page}: HTTP 403, waiting 60s...")
                 time.sleep(60)
                 continue
             
@@ -406,7 +411,7 @@ def search_worker(worker_id, search_type, start_page):
             if not items:
                 consecutive_empty += 1
                 if consecutive_empty >= 5:
-                    safe_print(f"[Worker-{worker_id}] {search_type} no more results (stopping)")
+                    safe_print(f"[Worker-{worker_id}] 📭 {search_type} no more results, stopping")
                     break
                 page += 1
                 time.sleep(1)
@@ -414,7 +419,7 @@ def search_worker(worker_id, search_type, start_page):
             
             consecutive_empty = 0
             
-            safe_print(f"[Worker-{worker_id}] {search_type} page {page}: {len(items)} items (total: {items_processed + len(items)})")
+            safe_print(f"[Worker-{worker_id}] 📄 {search_type} page {page}: {len(items)} items (total: {items_processed + len(items)})")
             
             for item in items:
                 if stop_event.is_set():
@@ -426,26 +431,27 @@ def search_worker(worker_id, search_type, start_page):
             time.sleep(0.5)
             
         except Exception as e:
-            safe_print(f"[Worker-{worker_id}] Error on page {page}: {e}")
+            safe_print(f"[Worker-{worker_id}] ❌ Error on page {page}: {e}")
             page += 1
             time.sleep(5)
             continue
     
+    # 处理剩余待验证 Key
     with batch_locks.get(worker_id, Lock()):
         if pending_count.get(worker_id, 0) > 0:
             batch = pending_batches.get(worker_id, []).copy()
             if batch:
-                safe_print(f"[Worker-{worker_id}] Processing remaining {len(batch)} keys")
+                safe_print(f"[Worker-{worker_id}] 📦 Processing remaining {len(batch)} keys")
                 verify_batch(worker_id, batch)
     
-    safe_print(f"[Worker-{worker_id}] Finished, processed {items_processed} items")
+    safe_print(f"[Worker-{worker_id}] 🏁 Finished, processed {items_processed} items")
 
 # ========== 主函数 ==========
 def main():
     print("=" * 70)
-    print("API Key Leak Scanner - Stable Version")
-    print(f"Supports: OpenAI (sk-proj-), OpenRouter, DeepSeek, Gemini, Anthropic, Cohere, Replicate, HuggingFace, MiMo")
-    print(f"Batch size: {BATCH_SIZE} | Max pages: {MAX_PAGES} | Max runtime: {MAX_RUNTIME_SECONDS}s (1.5h)")
+    print("🤖 API Key Leak Scanner - Detailed Log Version")
+    print(f"📊 Supports: OpenAI(sk-proj-), OpenRouter, DeepSeek, Gemini, Anthropic, Cohere, Replicate, HuggingFace, MiMo")
+    print(f"⚙️  Batch size: {BATCH_SIZE} | Max pages: {MAX_PAGES} | Max runtime: {MAX_RUNTIME_SECONDS}s (1.5h)")
     print("=" * 70)
     
     g = get_github_client()
