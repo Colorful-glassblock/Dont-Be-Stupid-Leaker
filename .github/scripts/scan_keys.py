@@ -11,7 +11,7 @@ import requests
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Tuple, Set, List, Dict
-from github import Github, GithubIntegration, GithubException
+from github import Github, Auth, GithubIntegration, GithubException
 
 # ========== Configuration ==========
 MAX_RUNTIME_SECONDS = 90 * 60
@@ -89,11 +89,12 @@ def get_installation_token():
     return resp.json()["token"]
 
 def get_github_client():
-    """获取 GitHub 客户端"""
+    """获取 GitHub 客户端 (使用新版 Auth.Token)"""
     token = get_installation_token()
     if not token:
         return None
-    return Github(token)
+    auth = Auth.Token(token)
+    return Github(auth=auth)
 
 def check_timeout():
     elapsed = time.time() - start_time
@@ -369,17 +370,15 @@ def check_and_reply():
     print(f"⏱️  Max runtime: {MAX_RUNTIME_SECONDS}s")
     print(f"{'='*60}\n")
     
+    # 获取 GitHub 客户端
     g = get_github_client()
     if not g:
-        print("❌ Failed to get GitHub client")
+        print("❌ Failed to get GitHub client due to missing token.")
         return
     
-    try:
-        user = g.get_user()
-        print(f"✅ Authenticated as: {user.login} (App)\n")
-    except Exception as e:
-        print(f"❌ Auth error: {e}")
-        return
+    # GitHub App 无法通过 g.get_user() 获取自身信息，会报 403
+    # 这并不影响后续扫描仓库的功能，所以直接跳过这个检查
+    print("✅ GitHub App client initialized. Starting scan...\n")
     
     state = load_state()
     current_page = state.get("current_page", 1)
