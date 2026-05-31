@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-API Key Leak Scanner - Detailed Log Version
+API Key Leak Scanner - Stable Version
 Supports: GitHub App + PAT fallback, OpenRouter, sk-proj-, 1.5h timeout
 """
 
@@ -30,7 +30,7 @@ PER_PAGE = 30
 MAX_PAGES = 50
 SEARCH_WORKERS = 3
 VERIFY_WORKERS = 30
-BATCH_SIZE = 30  # 每30个Key触发一次验证
+BATCH_SIZE = 30
 
 # GitHub App 配置 (从环境变量读取)
 APP_ID = os.environ.get("APP_ID")
@@ -64,7 +64,7 @@ pending_batches: Dict[int, List[Tuple]] = defaultdict(list)
 batch_locks: Dict[int, Lock] = {}
 pending_count: Dict[int, int] = defaultdict(int)
 
-# ========== 多供应商 Key 正则 ==========
+# ========== 多供应商 Key 正则 (Cohere 已移除) ==========
 KEY_PATTERNS = {
     "OpenAI": re.compile(r"sk-proj-[a-zA-Z0-9]{32,}"),
     "OpenAI_Legacy": re.compile(r"sk-[a-zA-Z0-9]{32,}"),
@@ -72,7 +72,6 @@ KEY_PATTERNS = {
     "DeepSeek": re.compile(r"sk-[a-zA-Z0-9]{32,}"),
     "Gemini": re.compile(r"AIza[0-9A-Za-z\-_]{35}"),
     "Anthropic": re.compile(r"sk-ant-api[0-9A-Za-z\-_]{40,}"),
-    "Cohere": re.compile(r"[a-zA-Z0-9]{40}"),
     "Replicate": re.compile(r"r8_[a-zA-Z0-9]{32,}"),
     "HuggingFace": re.compile(r"hf_[a-zA-Z0-9]{30,}"),
     "MiMo": re.compile(r"tp-[a-zA-Z0-9]{10,}"),
@@ -119,13 +118,6 @@ def _parse_gemini(code, data):
 def _parse_anthropic(code, data):
     if code == 200:
         return True, 0, "Valid"
-    if code == 400:
-        return True, 0, "Possibly valid (request error)"
-    return False, 0, f"HTTP {code}"
-
-def _parse_cohere(code, data):
-    if code == 200:
-        return True, 0, "Valid"
     return False, 0, f"HTTP {code}"
 
 def _parse_replicate(code, data):
@@ -154,7 +146,6 @@ VERIFIERS = {
     "DeepSeek": {"url": "https://api.deepseek.com/user/balance", "headers": lambda k: {"Authorization": f"Bearer {k}", "Accept": "application/json"}, "method": "GET", "parse": _parse_deepseek},
     "Gemini": {"url": lambda k: f"https://generativelanguage.googleapis.com/v1/models?key={k}", "headers": lambda k: {}, "method": "GET", "parse": _parse_gemini},
     "Anthropic": {"url": "https://api.anthropic.com/v1/messages", "headers": lambda k: {"x-api-key": k, "anthropic-version": "2023-06-01", "Content-Type": "application/json"}, "method": "POST", "body": lambda: json.dumps({"model": "claude-3-haiku-20240307", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}).encode(), "parse": _parse_anthropic},
-    "Cohere": {"url": "https://api.cohere.ai/v1/models", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_cohere},
     "Replicate": {"url": "https://api.replicate.com/v1/account", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_replicate},
     "HuggingFace": {"url": "https://huggingface.co/api/whoami", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_huggingface},
     "MiMo": {"url": "https://token-plan-cn.xiaomimimo.com/v1/models", "headers": lambda k: {"Authorization": f"Bearer {k}", "X-Plan-Type": "token-plan"}, "method": "GET", "parse": _parse_mimo},
@@ -259,7 +250,7 @@ def build_reply(author, service, key, info, source_url, source_type):
     masked = key[:12] + "..." + key[-8:] if len(key) > 24 else key
     return f"@{author} Your API key has been exposed!\n\n# Summary\nThis is a **{service}** API key found in {source_type}: [{source_url}]({source_url}).\n\nKey preview: `{masked}`\n\nVerification result: {info}\n\n---\n\n**What to do:**\n1. Revoke this key from {service} dashboard\n2. Generate a new key\n3. Remove the exposed key\n4. Rotate other exposed secrets\n\n---\n{BOT_SIGNATURE}"
 
-# ========== 验证批次（每条都打印） ==========
+# ========== 验证批次 ==========
 def verify_batch(worker_id, batch):
     if not batch:
         return
@@ -297,12 +288,6 @@ def verify_batch(worker_id, batch):
                         found_valid_keys.append((key, service, balance, info, source_url, source_type, datetime.now()))
                     with open("valid_keys_realtime.txt", "a") as f:
                         f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | {service} | {key} | {info} | {source_url}\n")
-                    # 可选：回复
-                    # try:
-                    #     reply = build_reply(author, service, key, info, source_url, source_type)
-                    #     # 回复逻辑...
-                    # except:
-                    #     pass
                 else:
                     print(f"  ❌ [{service}] {key[:25]}... -> {info}")
             except Exception as e:
@@ -326,7 +311,6 @@ def extract_and_queue(text, source_url, source_type, worker_id, author):
     for service, pattern in KEY_PATTERNS.items():
         for match in pattern.finditer(text):
             key = match.group(0)
-            # 简单去重
             with valid_lock:
                 if any(key == k for k, _, _, _, _, _, _ in found_valid_keys):
                     continue
@@ -339,7 +323,6 @@ def process_item(item, item_type, worker_id):
         body = item.get("body", "") or ""
         author = item.get("user", {}).get("login", "unknown")
         full_text = title + "\n" + body
-        # 获取评论
         try:
             comments_url = item.get("comments_url", "")
             if comments_url:
@@ -354,7 +337,6 @@ def process_item(item, item_type, worker_id):
         message = item.get("commit", {}).get("message", "")
         author = item.get("author", {}).get("login", "unknown") if item.get("author") else "unknown"
         full_text = message
-        # 获取 diff
         try:
             diff_url = url.replace("github.com", "api.github.com/repos")
             diff_url = diff_url.replace("/commit/", "/commits/")
@@ -367,7 +349,6 @@ def process_item(item, item_type, worker_id):
         except:
             pass
     
-    # 限制文本长度避免过大
     if len(full_text) > 50000:
         full_text = full_text[:50000]
     
@@ -436,7 +417,6 @@ def search_worker(worker_id, search_type, start_page):
             time.sleep(5)
             continue
     
-    # 处理剩余待验证 Key
     with batch_locks.get(worker_id, Lock()):
         if pending_count.get(worker_id, 0) > 0:
             batch = pending_batches.get(worker_id, []).copy()
@@ -449,8 +429,8 @@ def search_worker(worker_id, search_type, start_page):
 # ========== 主函数 ==========
 def main():
     print("=" * 70)
-    print("🤖 API Key Leak Scanner - Detailed Log Version")
-    print(f"📊 Supports: OpenAI(sk-proj-), OpenRouter, DeepSeek, Gemini, Anthropic, Cohere, Replicate, HuggingFace, MiMo")
+    print("🤖 API Key Leak Scanner - Stable Version")
+    print(f"📊 Supports: OpenAI(sk-proj-), OpenRouter, DeepSeek, Gemini, Anthropic, Replicate, HuggingFace, MiMo")
     print(f"⚙️  Batch size: {BATCH_SIZE} | Max pages: {MAX_PAGES} | Max runtime: {MAX_RUNTIME_SECONDS}s (1.5h)")
     print("=" * 70)
     
