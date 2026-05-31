@@ -124,7 +124,7 @@ def load_state():
                 state["current_page"] = 1
             return state
     except:
-        return {"replied_commits": [], "replied_codes": [], "replied_issues": [], 
+        return {"replied_commits": [], "replied_issues": [], 
                 "processed_repos": [], "current_page": 1}
 
 def save_state(state=None):
@@ -238,9 +238,6 @@ def build_reply(author, service, key, info, source_url, source_type, location, l
 def has_replied_to_commit(commit_sha, state):
     return commit_sha in state.get("replied_commits", [])
 
-def has_replied_to_code(file_id, state):
-    return file_id in state.get("replied_codes", [])
-
 def has_replied_to_issue(issue_id, state):
     return str(issue_id) in state.get("replied_issues", [])
 
@@ -249,12 +246,6 @@ def mark_replied_commit(commit_sha, state):
         state["replied_commits"] = []
     if commit_sha not in state["replied_commits"]:
         state["replied_commits"].append(commit_sha)
-
-def mark_replied_code(file_id, state):
-    if "replied_codes" not in state:
-        state["replied_codes"] = []
-    if file_id not in state["replied_codes"]:
-        state["replied_codes"].append(file_id)
 
 def mark_replied_issue(issue_id, state):
     if "replied_issues" not in state:
@@ -269,23 +260,20 @@ def save_result():
     print(f"💾 Saved to {fname}")
 
 def get_repos_by_page(g, page):
+    """获取按更新时间排序的仓库"""
     try:
-        results = g.search_repositories("language:python", sort="updated", order="desc")
+        results = g.search_repositories("stars:>0", sort="updated", order="desc")
         items = results.get_page(page)
         return [repo.full_name for repo in items]
     except GithubException as e:
-        if e.status == 422:
-            try:
-                results = g.search_repositories("stars:>0", sort="updated", order="desc")
-                items = results.get_page(page)
-                return [repo.full_name for repo in items]
-            except:
-                return []
+        print(f"  Repo search error: {e}")
         return []
-    except Exception:
+    except Exception as e:
+        print(f"  Repo search error: {e}")
         return []
 
 def scan_single_repo(g, repo_full_name, state, processed):
+    """扫描单个仓库的 Issues 和 Commits（无 Code Search）"""
     print(f"\n  📦 Scanning: {repo_full_name}")
     
     try:
@@ -296,68 +284,155 @@ def scan_single_repo(g, repo_full_name, state, processed):
     
     replied_total = 0
     
-    # Scan code files
+    # ========== 1. 扫描 Issues ==========
+    print(f"    🔍 Scanning issues...")
     try:
-        code_query = f"repo:{repo_full_name} sk- OR sk-proj- OR AIza OR sk-ant-api OR r8_ OR hf_ OR tp-"
-        code_results = list(g.search_code(code_query))[:30]
-        
-        for code in code_results:
-            if stop_scan:
+        issues = repo.get_issues(state="all", sort="created", direction="desc")
+        issue_count = 0
+        for issue in issues:
+            if stop_scan or issue_count >= 30:
                 break
+            issue_count += 1
             heartbeat()
             check_timeout()
             
-            file_path = code.path
-            file_url = code.html_url
-            file_id = f"{repo_full_name}_{file_path}"
-            
-            if has_replied_to_code(file_id, state):
+            num = issue.number
+            if has_replied_to_issue(num, state):
                 continue
             
-            raw_url = f"https://raw.githubusercontent.com/{repo_full_name}/HEAD/{file_path}"
-            content = ""
+            title = issue.title
+            body = issue.body or ""
+            full_text = f"{title}\n{body}"
+            
             try:
-                resp = requests.get(raw_url, headers={"User-Agent": USER_AGENTS[0]}, timeout=10)
-                if resp.status_code == 200:
-                    content = resp.text
+                for c in issue.get_comments():
+                    full_text += f"\n{c.body or ''}"
             except:
-                continue
+                pass
             
             for service, pattern in KEY_PATTERNS.items():
-                for m in pattern.finditer(content):
+                for m in pattern.finditer(full_text):
                     key = m.group(0)
-                    uid = f"code_{file_id}_{key[:16]}"
+                    uid = f"i_{num}_{key[:16]}"
                     if uid in processed:
                         continue
                     
                     line_num = None
                     line_content = ""
-                    lines = content.split('\n')
-                    for i, line in enumerate(lines):
-                        if key in line:
-                            line_num = i + 1
-                            line_content = line.strip()[:300]
-                            break
+                    loc = "issue"
+                    if key in title:
+                        line_num = 1
+                        line_content = title[:200]
+                    elif key in body:
+                        lines = body.split('\n')
+                        for i, l in enumerate(lines):
+                            if key in l:
+                                line_num = i + 1
+                                line_content = l.strip()[:200]
+                                break
+                    else:
+                        loc = "issue comment"
+                        line_content = key[:200]
                     
                     valid, bal, info = verify_key(service, key)
                     if valid:
                         processed.add(uid)
-                        author = repo.owner.login
-                        reply = build_reply(author, service, key, info, file_url, "code file", file_path, line_num, line_content, bal)
+                        reply = build_reply(issue.user.login, service, key, info, issue.html_url, "issue", loc, line_num, line_content, bal)
                         try:
-                            new_issue = repo.create_issue(title=f"🚨 API Key Leak in {file_path}", body=reply, labels=["security"])
-                            mark_replied_code(file_id, state)
+                            issue.create_comment(reply)
+                            mark_replied_issue(num, state)
                             save_state(state)
                             scan_results["replied_count"] += 1
-                            scan_results["found_keys"].append({"type":"code","repo":repo_full_name,"file":file_path,"service":service,"key":key,"balance":bal,"info":info})
+                            scan_results["found_keys"].append({"type":"issue","repo":repo_full_name,"number":num,"service":service,"key":key,"balance":bal,"info":info})
                             replied_total += 1
-                            print(f"      ✅ Created issue #{new_issue.number}")
+                            print(f"      ✅ Replied to issue #{num} - {service} key")
                             time.sleep(1)
                         except Exception as e:
                             scan_results["errors"].append(str(e))
             time.sleep(0.3)
     except Exception as e:
-        pass
+        print(f"    Issue scan error: {e}")
+    
+    # ========== 2. 扫描 Commits ==========
+    print(f"    🔍 Scanning commits...")
+    try:
+        commits = repo.get_commits()
+        commit_count = 0
+        for commit in commits:
+            if stop_scan or commit_count >= 30:
+                break
+            commit_count += 1
+            heartbeat()
+            check_timeout()
+            
+            sha = commit.sha
+            if has_replied_to_commit(sha, state):
+                continue
+            
+            msg = commit.commit.message
+            title = msg.split('\n')[0]
+            author = commit.author.login if commit.author else "unknown"
+            
+            full_text = title + "\n" + msg
+            diff = ""
+            try:
+                files = repo.get_commit(sha).files
+                for f in files:
+                    if f.patch:
+                        diff += f.patch + "\n"
+                full_text += "\n" + diff
+            except:
+                pass
+            
+            for service, pattern in KEY_PATTERNS.items():
+                for m in pattern.finditer(full_text):
+                    key = m.group(0)
+                    uid = f"commit_{sha}_{key[:16]}"
+                    if uid in processed:
+                        continue
+                    
+                    line_num = None
+                    line_content = ""
+                    loc = "commit diff"
+                    
+                    if key in title:
+                        line_num = 1
+                        line_content = title[:200]
+                        loc = "commit title"
+                    elif key in msg:
+                        lines = msg.split('\n')
+                        for i, l in enumerate(lines):
+                            if key in l:
+                                line_num = i + 1
+                                line_content = l.strip()[:200]
+                                break
+                        loc = "commit message"
+                    elif key in diff:
+                        lines = diff.split('\n')
+                        for i, l in enumerate(lines):
+                            if key in l:
+                                line_num = i + 1
+                                line_content = l.strip()[:200]
+                                break
+                    
+                    valid, bal, info = verify_key(service, key)
+                    if valid:
+                        processed.add(uid)
+                        reply = build_reply(author, service, key, info, commit.html_url, "commit", loc, line_num, line_content, bal)
+                        try:
+                            repo.get_commit(sha).create_comment(reply)
+                            mark_replied_commit(sha, state)
+                            save_state(state)
+                            scan_results["replied_count"] += 1
+                            scan_results["found_keys"].append({"type":"commit","repo":repo_full_name,"sha":sha,"service":service,"key":key,"balance":bal,"info":info})
+                            replied_total += 1
+                            print(f"      ✅ Replied to commit {sha[:8]} - {service} key")
+                            time.sleep(1)
+                        except Exception as e:
+                            scan_results["errors"].append(str(e))
+            time.sleep(0.3)
+    except Exception as e:
+        print(f"    Commit scan error: {e}")
     
     return replied_total
 
@@ -368,16 +443,14 @@ def check_and_reply():
     print(f"🤖 {BOT_NAME} - API Key Leak Scanner (GitHub App)")
     print(f"📁 Self repo: {REPO_NAME}")
     print(f"⏱️  Max runtime: {MAX_RUNTIME_SECONDS}s")
+    print(f"🔍 Scanning: Issues + Commits (no code search)")
     print(f"{'='*60}\n")
     
-    # 获取 GitHub 客户端
     g = get_github_client()
     if not g:
-        print("❌ Failed to get GitHub client due to missing token.")
+        print("❌ Failed to get GitHub client")
         return
     
-    # GitHub App 无法通过 g.get_user() 获取自身信息，会报 403
-    # 这并不影响后续扫描仓库的功能，所以直接跳过这个检查
     print("✅ GitHub App client initialized. Starting scan...\n")
     
     state = load_state()
