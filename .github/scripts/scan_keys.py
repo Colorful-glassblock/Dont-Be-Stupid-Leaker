@@ -17,10 +17,9 @@ from github import Github, Auth, GithubException
 MAX_RUNTIME_SECONDS = 90 * 60
 HEARTBEAT_INTERVAL = 300
 BATCH_DELAY = 3
-BATCH_SIZE = 15  # 每批取15条
+BATCH_SIZE = 15
 MAX_WORKERS = 10
 
-# GitHub App 配置
 APP_ID = os.environ.get("APP_ID")
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY")
 INSTALLATION_ID = int(os.environ.get("INSTALLATION_ID", "0"))
@@ -33,9 +32,7 @@ REPO_NAME = os.environ.get("GITHUB_REPOSITORY", "Colorful-glassblock/Dont-Be-Stu
 BOT_NAME = "llmapicheckbot2"
 BOT_SIGNATURE = f"*This message was sent by {BOT_NAME} - Repository: {REPO_NAME}*"
 
-USER_AGENTS = [
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
-]
+USER_AGENTS = ["Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"]
 
 STATE_FILE = "replied_state.json"
 
@@ -50,7 +47,6 @@ start_time = time.time()
 last_heartbeat = start_time
 stop_scan = False
 
-# 拆分搜索条件
 ISSUE_QUERIES = [
     '"your key leak"',
     '"sk-" OR "sk-proj-" OR "AIza"',
@@ -77,21 +73,13 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 def get_jwt():
-    private_key = PRIVATE_KEY
-    payload = {
-        "iat": int(time.time()),
-        "exp": int(time.time()) + 600,
-        "iss": APP_ID
-    }
-    return jwt.encode(payload, private_key, algorithm="RS256")
+    payload = {"iat": int(time.time()), "exp": int(time.time()) + 600, "iss": APP_ID}
+    return jwt.encode(payload, PRIVATE_KEY, algorithm="RS256")
 
 def get_installation_token():
     jwt_token = get_jwt()
     url = f"https://api.github.com/app/installations/{INSTALLATION_ID}/access_tokens"
-    headers = {
-        "Authorization": f"Bearer {jwt_token}",
-        "Accept": "application/vnd.github+json"
-    }
+    headers = {"Authorization": f"Bearer {jwt_token}", "Accept": "application/vnd.github+json"}
     resp = requests.post(url, headers=headers)
     if resp.status_code != 201:
         print(f"Error getting installation token: {resp.status_code}")
@@ -265,23 +253,22 @@ def save_result():
         json.dump(scan_results, f, indent=2)
     print(f"💾 Saved to {fname}")
 
-def fetch_items_with_retry(search_func, query, limit=30):
-    """通用获取函数，遇到403重置"""
-    all_items = []
+def fetch_issues_for_query(g, query, limit=30):
+    """获取单个查询的 issues"""
+    items = []
     page = 1
-    
-    while len(all_items) < limit and not stop_scan:
+    while len(items) < limit and not stop_scan:
         try:
-            results = search_func(query, sort="created", order="desc")
-            items = list(results.get_page(page))
-            if not items:
+            results = g.search_issues(query, sort="created", order="desc")
+            page_items = list(results.get_page(page))
+            if not page_items:
                 break
-            all_items.extend(items)
+            items.extend(page_items)
             page += 1
             time.sleep(0.3)
         except GithubException as e:
             if e.status == 403:
-                print(f"    ⚠️ 403, resetting to page 1")
+                print(f"    ⚠️ 403 on issues, resetting page 1")
                 page = 1
                 time.sleep(60)
                 continue
@@ -291,11 +278,37 @@ def fetch_items_with_retry(search_func, query, limit=30):
         except Exception as e:
             print(f"    Error: {e}")
             break
-    
-    return all_items[:limit]
+    return items[:limit]
+
+def fetch_commits_for_query(g, query, limit=30):
+    """获取单个查询的 commits"""
+    items = []
+    page = 1
+    while len(items) < limit and not stop_scan:
+        try:
+            # commits 使用 committer-date 排序
+            results = g.search_commits(query, sort="committer-date", order="desc")
+            page_items = list(results.get_page(page))
+            if not page_items:
+                break
+            items.extend(page_items)
+            page += 1
+            time.sleep(0.3)
+        except GithubException as e:
+            if e.status == 403:
+                print(f"    ⚠️ 403 on commits, resetting page 1")
+                page = 1
+                time.sleep(60)
+                continue
+            else:
+                print(f"    Error: {e}")
+                break
+        except Exception as e:
+            print(f"    Error: {e}")
+            break
+    return items[:limit]
 
 def process_issue(g, issue, state, processed):
-    """处理单个 issue"""
     num = issue.number
     if has_replied_to_issue(num, state):
         return 0
@@ -352,7 +365,6 @@ def process_issue(g, issue, state, processed):
     return 0
 
 def process_commit(g, commit, state, processed):
-    """处理单个 commit"""
     sha = commit.sha
     if has_replied_to_commit(sha, state):
         return 0
@@ -422,7 +434,6 @@ def process_commit(g, commit, state, processed):
     return 0
 
 def scan_issues_parallel(g, state, processed):
-    """并行扫描 Issues"""
     print(f"\n  📄 Fetching issues...")
     all_issues = []
     seen_urls = set()
@@ -431,7 +442,7 @@ def scan_issues_parallel(g, state, processed):
         if stop_scan:
             break
         print(f"    Query: {query[:40]}...")
-        items = fetch_items_with_retry(g.search_issues, query, limit=30)
+        items = fetch_issues_for_query(g, query, limit=20)
         for item in items:
             if item.html_url not in seen_urls:
                 seen_urls.add(item.html_url)
@@ -444,7 +455,6 @@ def scan_issues_parallel(g, state, processed):
     
     print(f"    Found {len(all_issues)} unique issues")
     
-    # 并行处理 issues
     replied = 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(process_issue, g, issue, state, processed): issue 
@@ -460,7 +470,6 @@ def scan_issues_parallel(g, state, processed):
     return replied
 
 def scan_commits_parallel(g, state, processed):
-    """并行扫描 Commits"""
     print(f"\n  📄 Fetching commits...")
     all_commits = []
     seen_urls = set()
@@ -469,7 +478,7 @@ def scan_commits_parallel(g, state, processed):
         if stop_scan:
             break
         print(f"    Query: {query[:40]}...")
-        items = fetch_items_with_retry(g.search_commits, query, limit=30)
+        items = fetch_commits_for_query(g, query, limit=20)
         for item in items:
             if item.html_url not in seen_urls:
                 seen_urls.add(item.html_url)
@@ -482,7 +491,6 @@ def scan_commits_parallel(g, state, processed):
     
     print(f"    Found {len(all_commits)} unique commits")
     
-    # 并行处理 commits
     replied = 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(process_commit, g, commit, state, processed): commit 
@@ -529,7 +537,6 @@ def check_and_reply():
         print(f"Batch #{batch_count} (Parallel)")
         print(f"{'='*50}")
         
-        # 并行执行 Issues 和 Commits 扫描
         with ThreadPoolExecutor(max_workers=2) as executor:
             issue_future = executor.submit(scan_issues_parallel, g, state, processed)
             commit_future = executor.submit(scan_commits_parallel, g, state, processed)
@@ -539,7 +546,6 @@ def check_and_reply():
         
         total_replied += issue_replied + commit_replied
         
-        # 保存进度
         save_state(state)
         
         print(f"\n📊 Batch #{batch_count} summary:")
