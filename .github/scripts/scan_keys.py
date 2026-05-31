@@ -1,39 +1,50 @@
 #!/usr/bin/env python3
+"""
+API Key Leak Scanner - Stable Version
+Supports: GitHub App + PAT fallback, OpenRouter, sk-proj-, 1.5h timeout
+"""
 
 import os
 import re
 import sys
-import time
 import json
+import ssl
 import jwt
+import time
 import signal
 import requests
-from datetime import datetime, timedelta
+import urllib.parse
+import urllib.request
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Tuple, Set, List, Dict
+from threading import Lock, Event
+from collections import defaultdict
+from typing import Optional, List, Tuple, Dict, Any
 from github import Github, Auth, GithubException
 
 # ========== Configuration ==========
-MAX_RUNTIME_SECONDS = 90 * 60
+MAX_RUNTIME_SECONDS = 90 * 60  # 1.5 hours
 HEARTBEAT_INTERVAL = 300
-BATCH_DELAY = 3
-BATCH_SIZE = 15          # 每批处理的 issue/commit 数量
-MAX_WORKERS = 10         # 处理 issue/commit 时的并发数
-FETCH_LIMIT = 15         # 每个查询最多获取多少条
+REQUEST_TIMEOUT = 10
+PER_PAGE = 30
+MAX_PAGES = 8
+SEARCH_WORKERS = 3
+VERIFY_WORKERS = 30
+BATCH_SIZE = 50
 
+# GitHub App 配置 (从环境变量读取)
 APP_ID = os.environ.get("APP_ID")
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY")
-INSTALLATION_ID = int(os.environ.get("INSTALLATION_ID", "0"))
-
-if not APP_ID or not PRIVATE_KEY or not INSTALLATION_ID:
-    print("Error: APP_ID, PRIVATE_KEY, INSTALLATION_ID must be set")
-    sys.exit(1)
+INSTALLATION_ID = os.environ.get("INSTALLATION_ID")
+PAT_TOKEN = os.environ.get("PAT_TOKEN")  # 备用
 
 REPO_NAME = os.environ.get("GITHUB_REPOSITORY", "Colorful-glassblock/Dont-Be-Stupid-Leaker")
-BOT_NAME = "llmapicheckbot2"
+BOT_NAME = "LLMApiCheckBot"
 BOT_SIGNATURE = f"*This message was sent by {BOT_NAME} - Repository: {REPO_NAME}*"
 
-USER_AGENTS = ["Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"]
+GITHUB_API = "https://api.github.com"
+ISSUE_QUERY = '"your key leak"'
+COMMIT_QUERY = 'sk-'
 
 STATE_FILE = "replied_state.json"
 
@@ -46,60 +57,168 @@ scan_results = {
 
 start_time = time.time()
 last_heartbeat = start_time
-stop_scan = False
+stop_event = Event()
+found_valid_keys: List[Tuple] = []
+valid_lock = Lock()
+pending_batches: Dict[int, List[Tuple]] = defaultdict(list)
+batch_locks: Dict[int, Lock] = {}
+pending_count: Dict[int, int] = defaultdict(int)
 
-ISSUE_QUERIES = [
-    '"your key leak"',
-    '"sk-" OR "sk-proj-" OR "AIza"',
-    '"sk-ant-api" OR "r8_" OR "hf_"',
-    '"tp-"'
-]
+# ========== 多供应商 Key 正则 ==========
+KEY_PATTERNS = {
+    "OpenAI": re.compile(r"sk-proj-[a-zA-Z0-9]{32,}"),
+    "OpenAI_Legacy": re.compile(r"sk-[a-zA-Z0-9]{32,}"),
+    "OpenRouter": re.compile(r"sk-or-v1-[a-zA-Z0-9]{50,}"),
+    "DeepSeek": re.compile(r"sk-[a-zA-Z0-9]{32,}"),
+    "Gemini": re.compile(r"AIza[0-9A-Za-z\-_]{35}"),
+    "Anthropic": re.compile(r"sk-ant-api[0-9A-Za-z\-_]{40,}"),
+    "Cohere": re.compile(r"[a-zA-Z0-9]{40}"),
+    "Replicate": re.compile(r"r8_[a-zA-Z0-9]{32,}"),
+    "HuggingFace": re.compile(r"hf_[a-zA-Z0-9]{30,}"),
+    "MiMo": re.compile(r"tp-[a-zA-Z0-9]{10,}"),
+}
 
-COMMIT_QUERIES = [
-    '"sk-" OR "sk-proj-" OR "AIza"',
-    '"sk-ant-api" OR "r8_" OR "hf_"',
-    '"tp-"'
-]
+# ========== 增强验证机制 ==========
+def _parse_openai(code, data):
+    if code != 200:
+        return False, 0, f"HTTP {code}"
+    if not isinstance(data, dict):
+        return False, 0, "Invalid response"
+    models = data.get("data", [])
+    if models and len(models) > 0:
+        return True, 0, "Valid OpenAI key"
+    return False, 0, "Invalid (no models)"
 
-def signal_handler(sig, frame):
-    global stop_scan
-    print(f"\n[!] Interrupted, saving state...")
-    stop_scan = True
-    time.sleep(2)
-    save_state()
-    save_result()
-    sys.exit(0)
+def _parse_openrouter(code, data):
+    if code == 200:
+        if isinstance(data, dict):
+            credits = data.get("credits", 0)
+            if credits:
+                return True, float(credits), f"Credits: {credits}"
+        return True, 0, "Valid OpenRouter key"
+    elif code == 401:
+        return False, 0, "Invalid OpenRouter key"
+    else:
+        return False, 0, f"HTTP {code}"
 
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
+def _parse_deepseek(code, data):
+    if code != 200 or not isinstance(data, dict) or not data.get("is_available"):
+        return False, 0, "Invalid or expired"
+    cny = sum(float(i.get("total_balance", 0)) for i in data.get("balance_infos", []) if i.get("currency") == "CNY")
+    usd = sum(float(i.get("total_balance", 0)) for i in data.get("balance_infos", []) if i.get("currency") == "USD")
+    total = cny + usd * 7.2
+    info = f"💰 CNY: {cny:.2f}, USD: {usd:.2f}" if cny or usd else "Valid (no balance)"
+    return True, total, info
 
-def get_jwt():
-    payload = {"iat": int(time.time()), "exp": int(time.time()) + 600, "iss": APP_ID}
-    return jwt.encode(payload, PRIVATE_KEY, algorithm="RS256")
+def _parse_gemini(code, data):
+    if code == 200 and isinstance(data, dict):
+        models = data.get("models", [])
+        if models and len(models) > 0:
+            return True, 0, "Valid Gemini key"
+    return False, 0, "Invalid"
 
-def get_installation_token():
-    jwt_token = get_jwt()
-    url = f"https://api.github.com/app/installations/{INSTALLATION_ID}/access_tokens"
-    headers = {"Authorization": f"Bearer {jwt_token}", "Accept": "application/vnd.github+json"}
-    resp = requests.post(url, headers=headers)
-    if resp.status_code != 201:
-        print(f"Error getting installation token: {resp.status_code}")
-        return None
-    return resp.json()["token"]
+def _parse_anthropic(code, data):
+    if code == 200:
+        return True, 0, "Valid Anthropic key"
+    return False, 0, f"HTTP {code}"
 
+def _parse_cohere(code, data):
+    if code == 200 and isinstance(data, dict):
+        models = data.get("models", [])
+        if models and len(models) > 0:
+            return True, 0, "Valid Cohere key"
+    return False, 0, "Invalid"
+
+def _parse_replicate(code, data):
+    if code == 200:
+        return True, 0, "Valid Replicate key"
+    return False, 0, f"HTTP {code}"
+
+def _parse_huggingface(code, data):
+    if code == 200:
+        return True, 0, "Valid HuggingFace key"
+    return False, 0, f"HTTP {code}"
+
+def _parse_mimo(code, data):
+    if code == 200 and isinstance(data, dict):
+        balance = float(data.get("balance", data.get("credit", 0)))
+        info = f"💰 Balance: {balance}" if balance > 0 else "Valid (no balance)"
+        return True, balance, info
+    return False, 0, "Invalid"
+
+VERIFIERS = {
+    "OpenAI": {"url": "https://api.openai.com/v1/models", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_openai},
+    "OpenAI_Legacy": {"url": "https://api.openai.com/v1/models", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_openai},
+    "OpenRouter": {"url": "https://openrouter.ai/api/v1/auth/key", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_openrouter},
+    "DeepSeek": {"url": "https://api.deepseek.com/user/balance", "headers": lambda k: {"Authorization": f"Bearer {k}", "Accept": "application/json"}, "method": "GET", "parse": _parse_deepseek},
+    "Gemini": {"url": lambda k: f"https://generativelanguage.googleapis.com/v1/models?key={k}", "headers": lambda k: {}, "method": "GET", "parse": _parse_gemini},
+    "Anthropic": {"url": "https://api.anthropic.com/v1/messages", "headers": lambda k: {"x-api-key": k, "anthropic-version": "2023-06-01", "Content-Type": "application/json"}, "method": "POST", "body": lambda: json.dumps({"model": "claude-3-haiku-20240307", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}).encode(), "parse": _parse_anthropic},
+    "Cohere": {"url": "https://api.cohere.ai/v1/models", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_cohere},
+    "Replicate": {"url": "https://api.replicate.com/v1/account", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_replicate},
+    "HuggingFace": {"url": "https://huggingface.co/api/whoami", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_huggingface},
+    "MiMo": {"url": "https://token-plan-cn.xiaomimimo.com/v1/models", "headers": lambda k: {"Authorization": f"Bearer {k}", "X-Plan-Type": "token-plan"}, "method": "GET", "parse": _parse_mimo},
+}
+
+# ========== GitHub 认证 (App优先，回退到PAT) ==========
 def get_github_client():
-    token = get_installation_token()
+    token = None
+    
+    # 尝试 GitHub App
+    if APP_ID and PRIVATE_KEY and INSTALLATION_ID:
+        try:
+            payload = {"iat": int(time.time()), "exp": int(time.time()) + 600, "iss": APP_ID}
+            jwt_token = jwt.encode(payload, PRIVATE_KEY, algorithm="RS256")
+            url = f"https://api.github.com/app/installations/{INSTALLATION_ID}/access_tokens"
+            headers = {"Authorization": f"Bearer {jwt_token}", "Accept": "application/vnd.github+json"}
+            resp = requests.post(url, headers=headers)
+            if resp.status_code == 201:
+                token = resp.json()["token"]
+                print("✅ Using GitHub App authentication")
+        except Exception as e:
+            print(f"⚠️ GitHub App auth failed: {e}")
+    
+    # 回退到 PAT
+    if not token and PAT_TOKEN:
+        token = PAT_TOKEN
+        print("✅ Using PAT authentication")
+    
     if not token:
+        print("❌ No authentication method available")
         return None
+    
     auth = Auth.Token(token)
     return Github(auth=auth)
+
+# ========== 工具函数 ==========
+def _gh_headers():
+    return {"Authorization": f"Bearer {PAT_TOKEN}", "Accept": "application/vnd.github+json", "User-Agent": "KeyScanner"}
+
+def _http_request(url, headers, method="GET", body=None, timeout=REQUEST_TIMEOUT):
+    try:
+        req = urllib.request.Request(url, headers=headers, method=method, data=body)
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            raw = resp.read().decode("utf-8")
+            try:
+                return resp.status, json.loads(raw)
+            except:
+                return resp.status, raw
+    except urllib.error.HTTPError as e:
+        return e.code, str(e)
+    except:
+        return 0, str(e)
+
+def safe_print(msg):
+    with print_lock:
+        print(msg, flush=True)
+
+print_lock = Lock()
 
 def check_timeout():
     elapsed = time.time() - start_time
     if elapsed >= MAX_RUNTIME_SECONDS:
-        print(f"[!] Max runtime reached. Exiting.")
-        save_state()
-        save_result()
+        print(f"\n[!] Max runtime reached ({MAX_RUNTIME_SECONDS}s). Exiting.")
+        save_final_results()
         sys.exit(0)
     return elapsed
 
@@ -108,472 +227,226 @@ def heartbeat():
     now = time.time()
     if now - last_heartbeat >= HEARTBEAT_INTERVAL:
         elapsed = now - start_time
-        print(f"[❤️] Alive: {elapsed:.0f}s / {MAX_RUNTIME_SECONDS}s")
+        remaining = MAX_RUNTIME_SECONDS - elapsed
+        print(f"[❤️] Alive: {elapsed:.0f}s / {MAX_RUNTIME_SECONDS}s (remaining: {remaining:.0f}s)")
         last_heartbeat = now
 
-def load_state():
-    try:
-        with open(STATE_FILE, "r") as f:
-            state = json.load(f)
-            if "replied_issues" not in state:
-                state["replied_issues"] = []
-            if "replied_commits" not in state:
-                state["replied_commits"] = []
-            return state
-    except:
-        return {"replied_issues": [], "replied_commits": []}
+def save_final_results():
+    with valid_lock:
+        if found_valid_keys:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            with open(f"valid_keys_final_{timestamp}.txt", "w") as f:
+                f.write(f"# Scan time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"# Total valid keys: {len(found_valid_keys)}\n\n")
+                for key, service, balance, info, source_url, _, _ in found_valid_keys:
+                    f.write(f"{service} | {key} | {info} | {source_url}\n")
+            print(f"\n💾 Saved {len(found_valid_keys)} keys to valid_keys_final_{timestamp}.txt")
 
-def save_state(state=None):
-    if state is None:
-        state = load_state()
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
+def signal_handler(sig, frame):
+    print("\n\n⚠️ Interrupted, saving results...")
+    stop_event.set()
+    time.sleep(2)
+    save_final_results()
+    sys.exit(0)
 
-KEY_PATTERNS = {
-    "OpenAI": re.compile(r"sk-proj-[a-zA-Z0-9]{32,}"),
-    "OpenAI_Legacy": re.compile(r"sk-[a-zA-Z0-9]{32,}"),
-    "OpenRouter": re.compile(r"sk-or-v1-[a-zA-Z0-9]{50,}"),
-    "DeepSeek": re.compile(r"sk-[a-zA-Z0-9]{32,}"),
-    "Gemini": re.compile(r"AIza[0-9A-Za-z\-_]{35}"),
-    "Anthropic": re.compile(r"sk-ant-api[0-9A-Za-z\-_]{40,}"),
-    "Replicate": re.compile(r"r8_[a-zA-Z0-9]{32,}"),
-    "HuggingFace": re.compile(r"hf_[a-zA-Z0-9]{30,}"),
-    "MiMo": re.compile(r"tp-[a-zA-Z0-9]{10,}"),
-}
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
-def _parse_deepseek(code, data):
-    if code != 200 or not isinstance(data, dict) or not data.get("is_available"):
-        return False, 0, "Invalid"
-    cny = sum(float(i.get("total_balance", 0)) for i in data.get("balance_infos", []) if i.get("currency") == "CNY")
-    usd = sum(float(i.get("total_balance", 0)) for i in data.get("balance_infos", []) if i.get("currency") == "USD")
-    info = f"💰 CNY: {cny:.2f}, USD: {usd:.2f}" if cny or usd else "✅ Valid (no balance)"
-    return True, cny + usd * 7.2, info
-
-def _parse_openai(code, data):
-    if code != 200 or not isinstance(data, dict):
-        return False, 0, f"HTTP {code}"
-    models = data.get("data", [])
-    if models and len(models) > 0 and models[0].get("id"):
-        return True, 0, "✅ Valid"
-    return False, 0, "❌ Invalid"
-
-def _parse_openrouter(code, data):
-    if code != 200 or not isinstance(data, dict):
-        return False, 0, f"HTTP {code}"
-    credits = data.get("credits", 0)
-    info = f"💰 Credits: {credits}" if credits > 0 else "✅ Valid (no credits)"
-    return True, float(credits), info
-
-def _parse_gemini(code, data):
-    if code != 200 or not isinstance(data, dict):
-        return False, 0, f"HTTP {code}"
-    models = data.get("models", [])
-    if models and len(models) > 0:
-        return True, 0, "✅ Valid"
-    return False, 0, "❌ Invalid"
-
-def _parse_anthropic(code, data):
-    if code == 200:
-        return True, 0, "✅ Valid"
-    return False, 0, f"❌ HTTP {code}"
-
-def _parse_replicate(code, data):
-    if code == 200:
-        return True, 0, "✅ Valid"
-    return False, 0, f"❌ HTTP {code}"
-
-def _parse_huggingface(code, data):
-    if code == 200:
-        return True, 0, "✅ Valid"
-    return False, 0, f"❌ HTTP {code}"
-
-def _parse_mimo(code, data):
-    if code == 200 and isinstance(data, dict):
-        balance = float(data.get("balance", data.get("credit", 0)))
-        info = f"💰 Balance: {balance}" if balance > 0 else "✅ Valid (no balance)"
-        return True, balance, info
-    return False, 0, "❌ Invalid"
-
-VERIFIERS = {
-    "OpenAI": {"url": "https://api.openai.com/v1/models", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_openai},
-    "OpenRouter": {"url": "https://openrouter.ai/api/v1/auth/key", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_openrouter},
-    "DeepSeek": {"url": "https://api.deepseek.com/user/balance", "headers": lambda k: {"Authorization": f"Bearer {k}", "Accept": "application/json"}, "method": "GET", "parse": _parse_deepseek},
-    "Gemini": {"url": lambda k: f"https://generativelanguage.googleapis.com/v1/models?key={k}", "headers": lambda k: {}, "method": "GET", "parse": _parse_gemini},
-    "Anthropic": {"url": "https://api.anthropic.com/v1/messages", "headers": lambda k: {"x-api-key": k, "anthropic-version": "2023-06-01", "Content-Type": "application/json"}, "method": "POST", "body": lambda: json.dumps({"model": "claude-3-haiku-20240307", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}).encode(), "parse": _parse_anthropic},
-    "Replicate": {"url": "https://api.replicate.com/v1/account", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_replicate},
-    "HuggingFace": {"url": "https://huggingface.co/api/whoami", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_huggingface},
-    "MiMo": {"url": "https://token-plan-cn.xiaomimimo.com/v1/models", "headers": lambda k: {"Authorization": f"Bearer {k}", "X-Plan-Type": "token-plan"}, "method": "GET", "parse": _parse_mimo},
-}
-
-def verify_key(service, key):
-    v = VERIFIERS.get(service)
-    if not v:
-        return False, 0, "Unsupported"
-    try:
-        check_timeout()
-        url = v["url"](key) if callable(v["url"]) else v["url"]
-        headers = v["headers"](key)
-        headers["User-Agent"] = USER_AGENTS[0]
-        body = v.get("body")
-        if body:
-            body = body()
-        if v["method"] == "GET":
-            resp = requests.get(url, headers=headers, timeout=10)
-        else:
-            resp = requests.post(url, headers=headers, data=body, timeout=10)
-        return v["parse"](resp.status_code, resp.json() if resp.text else None)
-    except Exception as e:
-        return False, 0, f"Error: {str(e)[:50]}"
-
-def build_reply(author, service, key, info, source_url, source_type, location, line_num, line_content, balance):
+# ========== 回复模板 (英文警告 leaker) ==========
+def build_reply(service, key, info, source_url, source_type):
     masked = key[:12] + "..." + key[-8:] if len(key) > 24 else key
-    loc_str = f"Location: {location}" + (f" (line {line_num})" if line_num else "")
-    return f"@{author} Your API key has been exposed!\n\n# Summary\nThis is a **{service}** API key found in {source_type}: [{source_url}]({source_url}).\n\n{loc_str}\nKey preview: `{masked}`\n\nVerification result: {info}\n\n---\n\n**What to do:**\n1. Revoke this key from {service} dashboard\n2. Generate a new key\n3. Remove the exposed key\n4. Rotate other exposed secrets\n\n**Exposed content:**\n```\n{line_content[:300] if line_content else 'Content too long'}\n```\n\n---\n{BOT_SIGNATURE}"
+    return f"""🔴 **API Key Leak Detected!**
 
-def has_replied_to_issue(issue_id, state):
-    return str(issue_id) in state.get("replied_issues", [])
+@{source_type.split('_')[0]} Your API key has been exposed in this {source_type}.
 
-def has_replied_to_commit(commit_sha, state):
-    return commit_sha in state.get("replied_commits", [])
+**Service:** `{service}`
+**Key preview:** `{masked}`
+**Status:** {info}
 
-def mark_replied_issue(issue_id, state):
-    if "replied_issues" not in state:
-        state["replied_issues"] = []
-    if str(issue_id) not in state["replied_issues"]:
-        state["replied_issues"].append(str(issue_id))
+⚠️ **Immediate Actions Required:**
+1. Revoke this key immediately from your {service} dashboard
+2. Generate a new key
+3. Remove the exposed key from git history
+4. Rotate any other secrets that may be compromised
 
-def mark_replied_commit(commit_sha, state):
-    if "replied_commits" not in state:
-        state["replied_commits"] = []
-    if commit_sha not in state["replied_commits"]:
-        state["replied_commits"].append(commit_sha)
+📍 **Source:** {source_url}
 
-def save_result():
-    fname = f"scan_result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    with open(fname, "w") as f:
-        json.dump(scan_results, f, indent=2)
-    print(f"💾 Saved to {fname}")
+---
+{BOT_SIGNATURE}"""
 
-def fetch_issues_for_query(g, query, limit=FETCH_LIMIT):
-    """获取单个查询的 issues（遇到403重试，但不无限等待）"""
-    items = []
-    page = 1
-    while len(items) < limit and not stop_scan:
+# ========== 批量验证 ==========
+def verify_batch(worker_id, batch):
+    if not batch:
+        return
+    safe_print(f"[Worker-{worker_id}] Verifying batch: {len(batch)} keys")
+    
+    def verify_one(key_info):
+        key, service, source_url, source_type = key_info
+        verifier = VERIFIERS.get(service)
+        if not verifier:
+            return None
         try:
-            results = g.search_issues(query, sort="created", order="desc")
-            page_items = list(results.get_page(page))
-            if not page_items:
-                break
-            items.extend(page_items)
-            page += 1
-            time.sleep(0.3)
-        except GithubException as e:
-            if e.status == 403:
-                print(f"    ⚠️ 403 on issues (query: {query[:30]}), waiting 30s and retry")
-                time.sleep(30)
-                continue
+            check_timeout()
+            url = verifier["url"](key) if callable(verifier["url"]) else verifier["url"]
+            headers = verifier["headers"](key)
+            headers["User-Agent"] = "KeyScanner"
+            body = verifier.get("body")
+            if body:
+                body = body()
+            if verifier["method"] == "GET":
+                resp = requests.get(url, headers=headers, timeout=8)
             else:
-                print(f"    Error: {e}")
-                break
-        except Exception as e:
-            print(f"    Error: {e}")
-            break
-    return items[:limit]
+                resp = requests.post(url, headers=headers, data=body, timeout=8)
+            valid, balance, info = verifier["parse"](resp.status_code, resp.json() if resp.text else None)
+            if valid:
+                return (key, service, balance, info, source_url, source_type, datetime.now())
+        except:
+            pass
+        return None
+    
+    results = []
+    with ThreadPoolExecutor(max_workers=VERIFY_WORKERS) as executor:
+        futures = [executor.submit(verify_one, ki) for ki in batch]
+        for future in as_completed(futures):
+            try:
+                result = future.result(timeout=15)
+                if result:
+                    results.append(result)
+            except:
+                pass
+    
+    if results:
+        with valid_lock:
+            for r in results:
+                found_valid_keys.append(r)
+                key, service, balance, info, source_url, source_type, _ = r
+                print(f"\n{'='*60}")
+                print(f"🎉 VALID KEY FOUND! [{service}]")
+                print(f"   Key: {key}")
+                print(f"   Source: {source_url[:80]}")
+                print(f"   Status: {info}")
+                print(f"{'='*60}\n")
+                with open("valid_keys_realtime.txt", "a") as f:
+                    f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | {service} | {key} | {info} | {source_url}\n")
+    
+    safe_print(f"[Worker-{worker_id}] Batch done: {len(results)} valid keys")
 
-def fetch_commits_for_query(g, query, limit=FETCH_LIMIT):
-    """获取单个查询的 commits（遇到403直接放弃，不重试，避免卡死）"""
-    items = []
-    page = 1
-    while len(items) < limit and not stop_scan:
+def add_key_to_pending(worker_id, key, service, source_url, source_type):
+    if worker_id not in batch_locks:
+        batch_locks[worker_id] = Lock()
+    with batch_locks[worker_id]:
+        pending_batches[worker_id].append((key, service, source_url, source_type))
+        pending_count[worker_id] += 1
+        if pending_count[worker_id] >= BATCH_SIZE:
+            batch = pending_batches[worker_id].copy()
+            pending_batches[worker_id].clear()
+            pending_count[worker_id] = 0
+            executor = ThreadPoolExecutor(max_workers=1)
+            executor.submit(verify_batch, worker_id, batch)
+            executor.shutdown(wait=False)
+
+def extract_and_queue(text, source_url, source_type, worker_id):
+    for service, pattern in KEY_PATTERNS.items():
+        for match in pattern.finditer(text):
+            key = match.group(0)
+            with valid_lock:
+                if any(key == k for k, _, _, _, _, _, _ in found_valid_keys):
+                    continue
+            add_key_to_pending(worker_id, key, service, source_url, source_type)
+
+def process_item(item, item_type, worker_id):
+    if item_type == "issue":
+        url = item.get("html_url", "")
+        title = item.get("title", "")
+        body = item.get("body", "") or ""
+        full_text = title + "\n" + body
+    else:
+        url = item.get("html_url", "")
+        message = item.get("commit", {}).get("message", "")
+        full_text = message
+    key_count = sum(len(pattern.findall(full_text)) for pattern in KEY_PATTERNS.values())
+    if key_count > 30:
+        return
+    extract_and_queue(full_text, url, f"{item_type}_body", worker_id)
+
+# ========== 搜索 Worker ==========
+def search_worker(worker_id, search_type, start_page):
+    safe_print(f"[Worker-{worker_id}] Starting {search_type} scan from page {start_page}")
+    query = ISSUE_QUERY if search_type == "issue" else COMMIT_QUERY
+    api_path = "issues" if search_type == "issue" else "commits"
+    encoded = urllib.parse.quote(query)
+    page = start_page
+    items_processed = 0
+    
+    while not stop_event.is_set() and page <= MAX_PAGES:
+        check_timeout()
+        heartbeat()
+        url = f"{GITHUB_API}/search/{api_path}?q={encoded}&sort=created&order=desc&per_page={PER_PAGE}&page={page}"
         try:
-            results = g.search_commits(query, sort="committer-date", order="desc")
-            page_items = list(results.get_page(page))
-            if not page_items:
+            code, data = _http_request(url, headers=_gh_headers(), timeout=REQUEST_TIMEOUT)
+            if code != 200:
+                safe_print(f"[Worker-{worker_id}] {search_type} page {page}: HTTP {code}")
+                page += 1
+                time.sleep(2)
+                continue
+            if not isinstance(data, dict):
                 break
-            items.extend(page_items)
+            items = data.get("items", [])
+            if not items:
+                break
+            safe_print(f"[Worker-{worker_id}] {search_type} page {page}: {len(items)} items")
+            for item in items:
+                if stop_event.is_set():
+                    break
+                process_item(item, search_type, worker_id)
+                items_processed += 1
             page += 1
-            time.sleep(0.3)
-        except GithubException as e:
-            if e.status == 403:
-                # 403 通常因为 commits 搜索权限不足，直接放弃该查询
-                print(f"    ⚠️ 403 on commits (query: {query[:30]}), skipping this query")
-                break
-            else:
-                print(f"    Error: {e}")
-                break
+            time.sleep(0.5)
         except Exception as e:
-            print(f"    Error: {e}")
-            break
-    return items[:limit]
+            safe_print(f"[Worker-{worker_id}] Error: {e}")
+            page += 1
+            time.sleep(2)
+    
+    with batch_locks.get(worker_id, Lock()):
+        if pending_count.get(worker_id, 0) > 0:
+            batch = pending_batches.get(worker_id, []).copy()
+            if batch:
+                safe_print(f"[Worker-{worker_id}] Processing remaining {len(batch)} keys")
+                verify_batch(worker_id, batch)
+    safe_print(f"[Worker-{worker_id}] Finished, processed {items_processed} items")
 
-def process_issue(g, issue, state, processed):
-    num = issue.number
-    if has_replied_to_issue(num, state):
-        return 0
-
-    title = issue.title
-    body = issue.body or ""
-    full_text = f"{title}\n{body}"
-
-    try:
-        for c in issue.get_comments():
-            full_text += f"\n{c.body or ''}"
-    except:
-        pass
-
-    for service, pattern in KEY_PATTERNS.items():
-        for m in pattern.finditer(full_text):
-            key = m.group(0)
-            uid = f"i_{num}_{key[:16]}"
-            if uid in processed:
-                continue
-
-            line_num = None
-            line_content = ""
-            loc = "issue"
-            if key in title:
-                line_num = 1
-                line_content = title[:200]
-            elif key in body:
-                lines = body.split('\n')
-                for i, l in enumerate(lines):
-                    if key in l:
-                        line_num = i + 1
-                        line_content = l.strip()[:200]
-                        break
-            else:
-                loc = "issue comment"
-                line_content = key[:200]
-
-            valid, bal, info = verify_key(service, key)
-            if valid:
-                processed.add(uid)
-                reply = build_reply(issue.user.login, service, key, info, issue.html_url, "issue", loc, line_num, line_content, bal)
-                try:
-                    issue.create_comment(reply)
-                    mark_replied_issue(num, state)
-                    save_state(state)
-                    scan_results["replied_count"] += 1
-                    scan_results["found_keys"].append({"type":"issue","number":num,"service":service,"key":key,"balance":bal,"info":info})
-                    print(f"      ✅ Replied to issue #{num} - {service} key")
-                    time.sleep(1)
-                    return 1
-                except Exception as e:
-                    scan_results["errors"].append(str(e))
-    return 0
-
-def process_commit(g, commit, state, processed):
-    sha = commit.sha
-    if has_replied_to_commit(sha, state):
-        return 0
-
-    msg = commit.commit.message
-    title = msg.split('\n')[0]
-    author = commit.author.login if commit.author else "unknown"
-
-    full_text = title + "\n" + msg
-    diff = ""
-    try:
-        if commit.repository:
-            files = commit.repository.get_commit(sha).files
-            for f in files:
-                if f.patch:
-                    diff += f.patch + "\n"
-            full_text += "\n" + diff
-    except:
-        pass
-
-    for service, pattern in KEY_PATTERNS.items():
-        for m in pattern.finditer(full_text):
-            key = m.group(0)
-            uid = f"c_{sha}_{key[:16]}"
-            if uid in processed:
-                continue
-
-            line_num = None
-            line_content = ""
-            loc = "commit diff"
-
-            if key in title:
-                line_num = 1
-                line_content = title[:200]
-                loc = "commit title"
-            elif key in msg:
-                lines = msg.split('\n')
-                for i, l in enumerate(lines):
-                    if key in l:
-                        line_num = i + 1
-                        line_content = l.strip()[:200]
-                        break
-                loc = "commit message"
-            elif key in diff:
-                lines = diff.split('\n')
-                for i, l in enumerate(lines):
-                    if key in l:
-                        line_num = i + 1
-                        line_content = l.strip()[:200]
-                        break
-
-            valid, bal, info = verify_key(service, key)
-            if valid:
-                processed.add(uid)
-                reply = build_reply(author, service, key, info, commit.html_url, "commit", loc, line_num, line_content, bal)
-                try:
-                    commit.create_comment(reply)
-                    mark_replied_commit(sha, state)
-                    save_state(state)
-                    scan_results["replied_count"] += 1
-                    scan_results["found_keys"].append({"type":"commit","sha":sha,"service":service,"key":key,"balance":bal,"info":info})
-                    print(f"      ✅ Replied to commit {sha[:8]} - {service} key")
-                    time.sleep(1)
-                    return 1
-                except Exception as e:
-                    scan_results["errors"].append(str(e))
-    return 0
-
-def scan_issues_parallel(g, state, processed):
-    print(f"\n  📄 Fetching issues...")
-    all_issues = []
-    seen_urls = set()
-
-    for query in ISSUE_QUERIES:
-        if stop_scan:
-            break
-        print(f"    Query: {query[:40]}...")
-        items = fetch_issues_for_query(g, query, limit=FETCH_LIMIT)
-        for item in items:
-            if item.html_url not in seen_urls:
-                seen_urls.add(item.html_url)
-                all_issues.append(item)
-        time.sleep(1)
-
-    if not all_issues:
-        print(f"    No issues found")
-        return 0
-
-    print(f"    Found {len(all_issues)} unique issues")
-    replied = 0
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(process_issue, g, issue, state, processed): issue 
-                   for issue in all_issues[:BATCH_SIZE]}
-        for future in as_completed(futures):
-            if stop_scan:
-                break
-            try:
-                replied += future.result()
-            except Exception as e:
-                scan_results["errors"].append(str(e))
-    return replied
-
-def scan_commits_parallel(g, state, processed):
-    print(f"\n  📄 Fetching commits...")
-    all_commits = []
-    seen_urls = set()
-
-    for query in COMMIT_QUERIES:
-        if stop_scan:
-            break
-        print(f"    Query: {query[:40]}...")
-        items = fetch_commits_for_query(g, query, limit=FETCH_LIMIT)
-        for item in items:
-            if item.html_url not in seen_urls:
-                seen_urls.add(item.html_url)
-                all_commits.append(item)
-        time.sleep(1)
-
-    if not all_commits:
-        print(f"    No commits found")
-        return 0
-
-    print(f"    Found {len(all_commits)} unique commits")
-    replied = 0
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(process_commit, g, commit, state, processed): commit 
-                   for commit in all_commits[:BATCH_SIZE]}
-        for future in as_completed(futures):
-            if stop_scan:
-                break
-            try:
-                replied += future.result()
-            except Exception as e:
-                scan_results["errors"].append(str(e))
-    return replied
-
-def check_and_reply():
-    global last_heartbeat, stop_scan
-
-    print(f"\n{'='*60}")
-    print(f"🤖 {BOT_NAME} - API Key Leak Scanner (GitHub App)")
-    print(f"📁 Self repo: {REPO_NAME}")
-    print(f"⏱️  Max runtime: {MAX_RUNTIME_SECONDS}s")
-    print(f"⚡ Parallel mode: Issues + Commits running simultaneously")
-    print(f"{'='*60}\n")
-
+# ========== 主函数 ==========
+def main():
+    print("=" * 70)
+    print("API Key Leak Scanner - Stable Version")
+    print(f"Supports: OpenAI (sk-proj-), OpenRouter, DeepSeek, Gemini, Anthropic, Cohere, Replicate, HuggingFace, MiMo")
+    print(f"Batch size: {BATCH_SIZE} | Max runtime: {MAX_RUNTIME_SECONDS}s (1.5h)")
+    print("=" * 70)
+    
     g = get_github_client()
     if not g:
-        print("❌ Failed to get GitHub client")
+        print("❌ Failed to initialize GitHub client")
         return
-
-    print("✅ GitHub App client initialized\n")
-
-    state = load_state()
-    print(f"📍 Loaded state: {len(state.get('replied_issues', []))} issues, {len(state.get('replied_commits', []))} commits replied\n")
-
-    processed = set()
-    total_replied = 0
-    batch_count = 0
-
-    while not stop_scan:
-        check_timeout()
-        batch_count += 1
-
-        print(f"\n{'='*50}")
-        print(f"Batch #{batch_count} (Parallel)")
-        print(f"{'='*50}")
-
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            issue_future = executor.submit(scan_issues_parallel, g, state, processed)
-            commit_future = executor.submit(scan_commits_parallel, g, state, processed)
-
-            issue_replied = issue_future.result()
-            commit_replied = commit_future.result()
-
-        total_replied += issue_replied + commit_replied
-        save_state(state)
-
-        print(f"\n📊 Batch #{batch_count} summary:")
-        print(f"   ✅ Issues replied: {issue_replied}")
-        print(f"   ✅ Commits replied: {commit_replied}")
-        print(f"   📈 Total replied: {total_replied}")
-        print(f"   📊 Keys found: {len(scan_results['found_keys'])}")
-
-        if not stop_scan:
-            print(f"\n💤 Waiting {BATCH_DELAY}s...")
-            for i in range(BATCH_DELAY):
-                if stop_scan:
-                    break
-                check_timeout()
-                time.sleep(1)
-
-    elapsed = time.time() - start_time
-    print(f"\n✅ Scan completed in {elapsed:.0f}s")
-    print(f"📊 Found {len(scan_results['found_keys'])} valid keys")
-    print(f"📊 Replied to {scan_results['replied_count']} items")
-
-    if scan_results['found_keys']:
-        print(f"\n🔑 Valid keys found:")
-        for i, key_info in enumerate(scan_results['found_keys'], 1):
-            print(f"   {i}. [{key_info['service']}] {key_info['key']}")
-            print(f"      {key_info['info']}")
-
-    save_result()
-    save_state(state)
+    
+    with ThreadPoolExecutor(max_workers=SEARCH_WORKERS) as executor:
+        futures = [
+            executor.submit(search_worker, 1, "issue", 1),
+            executor.submit(search_worker, 2, "issue", 4),
+            executor.submit(search_worker, 3, "commit", 1)
+        ]
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except:
+                pass
+    
+    save_final_results()
+    print(f"\n✅ Scan completed. Found {len(found_valid_keys)} valid keys.")
 
 if __name__ == "__main__":
     try:
-        check_and_reply()
+        main()
     except Exception as e:
         print(f"❌ Fatal error: {e}")
-        save_state()
-        save_result()
+        save_final_results()
         sys.exit(1)
