@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-API Key Leak Scanner - Full Version with Smart Reply
-- Issue leaks: reply directly in the issue
-- Code/Commit leaks: create issue in Dont-Be-Stupid-Leaker repository
+API Key Leak Scanner - Infinite Scroll Version with Smart Reply
+- Issues: reply directly (check if already replied)
+- Code/Commits: create issue in Dont-Be-Stupid-Leaker (check duplicates)
+- Infinite pagination (no page limit)
 """
 
 import os
@@ -28,7 +29,6 @@ MAX_RUNTIME_SECONDS = 90 * 60
 HEARTBEAT_INTERVAL = 300
 REQUEST_TIMEOUT = 15
 PER_PAGE = 30
-MAX_PAGES = 30
 SEARCH_WORKERS = 4
 VERIFY_WORKERS = 30
 BATCH_SIZE = 30
@@ -60,7 +60,7 @@ pending_batches: Dict[int, List[Tuple]] = defaultdict(list)
 batch_locks: Dict[int, Lock] = {}
 pending_count: Dict[int, int] = defaultdict(int)
 
-# 已回复的记录
+# 已回复的记录（内存缓存）
 replied_issues: set = set()
 replied_lock = Lock()
 
@@ -268,17 +268,18 @@ def build_reply(author, service, key, info, source_url, source_type):
 ---
 {BOT_SIGNATURE}"""
 
-# ========== 智能回复函数 ==========
+# ========== 智能回复函数（带重复检查） ==========
 def smart_reply(g, key, service, info, source_url, source_type, author):
     """
     智能回复：
-    - Issue 来源：直接回复原 Issue
-    - Code/Commit 来源：在自己的仓库创建 Issue
+    - Issue 来源：直接回复原 Issue（检查 Bot 是否已回复过）
+    - Code/Commit 来源：在自己的仓库创建 Issue（检查是否已存在相同来源的 Issue）
     """
     message = build_reply(author, service, key, info, source_url, source_type)
     
     with replied_lock:
         if source_url in replied_issues:
+            print(f"    ⏭️ Already processed this source (memory cache), skipping")
             return
         replied_issues.add(source_url)
     
@@ -294,6 +295,23 @@ def smart_reply(g, key, service, info, source_url, source_type, author):
             
             repo = g.get_repo(repo_path)
             issue = repo.get_issue(number=issue_num)
+            
+            # 检查 Bot 是否已经回复过此 Issue
+            bot_login = g.get_user().login
+            already_replied = False
+            try:
+                comments = issue.get_comments()
+                for comment in comments:
+                    if comment.user.login == bot_login and "API Key Leak Detected" in comment.body:
+                        already_replied = True
+                        break
+            except Exception as e:
+                print(f"    ⚠️ Failed to check comments: {e}")
+            
+            if already_replied:
+                print(f"    ⏭️ Already replied to issue #{issue_num}, skipping")
+                return
+            
             issue.create_comment(message)
             print(f"    📝 Replied to issue #{issue_num} in {repo_path}")
         except Exception as e:
@@ -302,6 +320,23 @@ def smart_reply(g, key, service, info, source_url, source_type, author):
         # Code/Commit 来源，在自己的仓库创建 Issue
         try:
             my_repo = g.get_repo(REPO_NAME)
+            
+            # 检查是否已经存在相同来源 URL 的 Issue
+            already_exists = False
+            existing_issue_num = None
+            try:
+                issues = my_repo.get_issues(state="all", labels=["leak", "security"])
+                for issue in issues:
+                    if source_url in issue.body:
+                        already_exists = True
+                        existing_issue_num = issue.number
+                        break
+            except Exception as e:
+                print(f"    ⚠️ Failed to check existing issues: {e}")
+            
+            if already_exists:
+                print(f"    ⏭️ Issue #{existing_issue_num} already exists for this source, skipping")
+                return
             
             # 生成简洁的标题
             short_url = source_url.replace("https://github.com/", "")
@@ -371,13 +406,13 @@ def verify_batch(worker_id, batch, g):
                     print(f"  ✅ [{service}] {key[:25]}... -> {info}")
                     print(f"     📍 Source: {source_url}")
                     
-                    # 保存
+                    # 保存到本地
                     with valid_lock:
                         found_valid_keys.append((key, service, balance, info, source_url, source_type, datetime.now()))
                     with open("valid_keys_realtime.txt", "a") as f:
                         f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | {service} | {key} | {info} | {source_url}\n")
                     
-                    # 智能回复
+                    # 智能回复（带重复检查）
                     smart_reply(g, key, service, info, source_url, source_type, author)
                     
                 else:
@@ -410,28 +445,48 @@ def extract_and_queue(text, source_url, source_type, worker_id, author, g):
             print(f"  🔑 Found {service} key in {source_type}: {source_url[:80]}...")
             add_key_to_pending(worker_id, key, service, source_url, source_type, author, g)
 
-# ========== Code 搜索 ==========
+# ========== Code 搜索（无限翻页） ==========
 def search_code_worker(worker_id, start_page, g):
-    safe_print(f"\n[Worker-{worker_id}] 🚀 Starting CODE scan from page {start_page}")
+    safe_print(f"\n[Worker-{worker_id}] 🚀 Starting CODE scan from page {start_page} (infinite)")
     page = start_page
     items_processed = 0
+    consecutive_empty = 0
     
-    while not stop_event.is_set() and page <= MAX_PAGES:
+    while not stop_event.is_set():
         check_timeout()
         heartbeat()
         
         url = f"{GITHUB_API}/search/code?q={urllib.parse.quote(CODE_QUERY)}&sort=indexed&order=desc&per_page={PER_PAGE}&page={page}"
         try:
             code, data = _http_request(url, headers=_gh_headers(), timeout=REQUEST_TIMEOUT)
+            
+            if code == 403:
+                safe_print(f"[Worker-{worker_id}] CODE page {page}: HTTP 403, waiting 60s...")
+                time.sleep(60)
+                continue
+            
             if code != 200:
-                safe_print(f"[Worker-{worker_id}] CODE page {page}: HTTP {code}")
+                safe_print(f"[Worker-{worker_id}] CODE page {page}: HTTP {code}, continuing")
                 page += 1
                 time.sleep(2)
                 continue
+            
             items = data.get("items", []) if isinstance(data, dict) else []
+            
+            # 空结果检测
             if not items:
-                break
-            safe_print(f"[Worker-{worker_id}] 📄 CODE page {page}: {len(items)} items")
+                consecutive_empty += 1
+                if consecutive_empty >= 3:
+                    safe_print(f"[Worker-{worker_id}] CODE: No more results after {page} pages, stopping")
+                    break
+                page += 1
+                time.sleep(1)
+                continue
+            
+            consecutive_empty = 0
+            
+            safe_print(f"[Worker-{worker_id}] 📄 CODE page {page}: {len(items)} items (total: {items_processed + len(items)})")
+            
             for item in items:
                 if stop_event.is_set():
                     break
@@ -444,37 +499,60 @@ def search_code_worker(worker_id, start_page, g):
                 except:
                     pass
                 items_processed += 1
+            
             page += 1
             time.sleep(0.5)
         except Exception as e:
             safe_print(f"[Worker-{worker_id}] CODE error: {e}")
             page += 1
             time.sleep(5)
-    safe_print(f"[Worker-{worker_id}] CODE scan finished, processed {items_processed} files")
+            continue
+    
+    safe_print(f"[Worker-{worker_id}] CODE scan finished, processed {items_processed} items")
 
-# ========== Issues 搜索 ==========
+# ========== Issues 搜索（无限翻页） ==========
 def search_issues_worker(worker_id, start_page, g):
-    safe_print(f"\n[Worker-{worker_id}] 🚀 Starting ISSUE scan from page {start_page}")
+    safe_print(f"\n[Worker-{worker_id}] 🚀 Starting ISSUE scan from page {start_page} (infinite)")
     query = ISSUE_QUERY
     page = start_page
     items_processed = 0
+    consecutive_empty = 0
     
-    while not stop_event.is_set() and page <= MAX_PAGES:
+    while not stop_event.is_set():
         check_timeout()
         heartbeat()
         
         url = f"{GITHUB_API}/search/issues?q={urllib.parse.quote(query)}&sort=created&order=desc&per_page={PER_PAGE}&page={page}"
         try:
             code, data = _http_request(url, headers=_gh_headers(), timeout=REQUEST_TIMEOUT)
+            
+            if code == 403:
+                safe_print(f"[Worker-{worker_id}] ISSUE page {page}: HTTP 403, waiting 60s...")
+                time.sleep(60)
+                continue
+            
             if code != 200:
-                safe_print(f"[Worker-{worker_id}] ISSUE page {page}: HTTP {code}")
+                safe_print(f"[Worker-{worker_id}] ISSUE page {page}: HTTP {code}, continuing")
                 page += 1
                 time.sleep(2)
                 continue
+            
             items = data.get("items", []) if isinstance(data, dict) else []
+            
+            # 空结果检测
             if not items:
-                break
-            safe_print(f"[Worker-{worker_id}] 📄 ISSUE page {page}: {len(items)} items")
+                consecutive_empty += 1
+                if consecutive_empty >= 3:
+                    safe_print(f"[Worker-{worker_id}] ISSUE: No more results after {page} pages, stopping")
+                    break
+                page += 1
+                time.sleep(1)
+                continue
+            
+            consecutive_empty = 0
+            
+            safe_print(f"[Worker-{worker_id}] 📄 ISSUE page {page}: {len(items)} items (total: {items_processed + len(items)})")
+            
             for item in items:
                 if stop_event.is_set():
                     break
@@ -482,7 +560,7 @@ def search_issues_worker(worker_id, start_page, g):
                 body = item.get("body", "") or ""
                 author = item.get("user", {}).get("login", "unknown")
                 full_text = title + "\n" + body
-                # 也获取评论内容
+                # 获取评论
                 try:
                     comments_url = item.get("comments_url", "")
                     if comments_url:
@@ -494,43 +572,66 @@ def search_issues_worker(worker_id, start_page, g):
                     pass
                 extract_and_queue(full_text, item.get("html_url", ""), "issue", worker_id, author, g)
                 items_processed += 1
+            
             page += 1
             time.sleep(0.5)
         except Exception as e:
             safe_print(f"[Worker-{worker_id}] ISSUE error: {e}")
             page += 1
             time.sleep(5)
+            continue
+    
     safe_print(f"[Worker-{worker_id}] ISSUE scan finished, processed {items_processed} items")
 
-# ========== Commits 搜索 ==========
+# ========== Commits 搜索（无限翻页） ==========
 def search_commits_worker(worker_id, start_page, g):
-    safe_print(f"\n[Worker-{worker_id}] 🚀 Starting COMMIT scan from page {start_page}")
+    safe_print(f"\n[Worker-{worker_id}] 🚀 Starting COMMIT scan from page {start_page} (infinite)")
     page = start_page
     items_processed = 0
+    consecutive_empty = 0
     
-    while not stop_event.is_set() and page <= MAX_PAGES:
+    while not stop_event.is_set():
         check_timeout()
         heartbeat()
         
         url = f"{GITHUB_API}/search/commits?q={urllib.parse.quote(COMMIT_QUERY)}&sort=committer-date&order=desc&per_page={PER_PAGE}&page={page}"
         try:
             code, data = _http_request(url, headers=_gh_headers(), timeout=REQUEST_TIMEOUT)
+            
+            if code == 403:
+                safe_print(f"[Worker-{worker_id}] COMMIT page {page}: HTTP 403, waiting 60s...")
+                time.sleep(60)
+                continue
+            
             if code != 200:
-                safe_print(f"[Worker-{worker_id}] COMMIT page {page}: HTTP {code}")
+                safe_print(f"[Worker-{worker_id}] COMMIT page {page}: HTTP {code}, continuing")
                 page += 1
                 time.sleep(2)
                 continue
+            
             items = data.get("items", []) if isinstance(data, dict) else []
+            
+            # 空结果检测
             if not items:
-                break
-            safe_print(f"[Worker-{worker_id}] 📄 COMMIT page {page}: {len(items)} items")
+                consecutive_empty += 1
+                if consecutive_empty >= 3:
+                    safe_print(f"[Worker-{worker_id}] COMMIT: No more results after {page} pages, stopping")
+                    break
+                page += 1
+                time.sleep(1)
+                continue
+            
+            consecutive_empty = 0
+            
+            safe_print(f"[Worker-{worker_id}] 📄 COMMIT page {page}: {len(items)} items (total: {items_processed + len(items)})")
+            
             for item in items:
                 if stop_event.is_set():
                     break
                 message = item.get("commit", {}).get("message", "")
                 author = item.get("author", {}).get("login", "unknown") if item.get("author") else "unknown"
-                # 尝试获取 diff 内容
                 full_text = message
+                # 获取 diff
                 try:
                     diff_url = item.get("html_url", "").replace("github.com", "api.github.com/repos")
                     diff_url = diff_url.replace("/commit/", "/commits/")
@@ -544,23 +645,27 @@ def search_commits_worker(worker_id, start_page, g):
                     pass
                 extract_and_queue(full_text, item.get("html_url", ""), "commit", worker_id, author, g)
                 items_processed += 1
+            
             page += 1
             time.sleep(0.5)
         except Exception as e:
             safe_print(f"[Worker-{worker_id}] COMMIT error: {e}")
             page += 1
             time.sleep(5)
+            continue
+    
     safe_print(f"[Worker-{worker_id}] COMMIT scan finished, processed {items_processed} items")
 
 # ========== 主函数 ==========
 def main():
     print("=" * 70)
-    print("🤖 API Key Leak Scanner - Smart Reply Version")
-    print("📊 Scanning: CODE + ISSUES + COMMITS")
+    print("🤖 API Key Leak Scanner - Infinite Scroll Version")
+    print("📊 Scanning: CODE + ISSUES + COMMITS (infinite pages)")
     print("📊 Supports: OpenAI(sk-proj-), OpenRouter, DeepSeek, Gemini, Anthropic, Replicate, HuggingFace, MiMo")
     print("📊 Reply Strategy:")
-    print("   - Issue leak: Reply directly in the original issue")
-    print(f"   - Code/Commit leak: Create issue in {REPO_NAME}")
+    print("   - Issue leak: Reply directly in the original issue (check if already replied)")
+    print(f"   - Code/Commit leak: Create issue in {REPO_NAME} (check if already exists)")
+    print("📊 Stops when: 3 consecutive empty pages OR 1.5 hour timeout OR Ctrl+C")
     print("=" * 70)
     
     g = get_github_client()
@@ -568,7 +673,12 @@ def main():
         print("❌ Failed to initialize GitHub client")
         return
     
-    print("✅ GitHub client initialized\n")
+    # 获取 Bot 用户名用于后续检查
+    try:
+        bot_user = g.get_user().login
+        print(f"✅ Bot identity: {bot_user}\n")
+    except:
+        print("⚠️ Could not get bot username\n")
     
     with ThreadPoolExecutor(max_workers=SEARCH_WORKERS) as executor:
         futures = [
