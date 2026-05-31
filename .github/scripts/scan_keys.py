@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-API Key Leak Scanner - Infinite Scroll Version with Smart Reply
-- Issues: reply directly (check if already replied)
-- Code/Commits: create issue in Dont-Be-Stupid-Leaker (check duplicates)
-- Infinite pagination (no page limit)
+API Key Leak Scanner - Final Version
+- All leaks create issues in Dont-Be-Stupid-Leaker
+- 29.5 minute timeout
+- Infinite pagination
 """
 
 import os
@@ -25,8 +25,8 @@ from typing import Optional, List, Tuple, Dict, Any
 from github import Github, Auth, GithubException
 
 # ========== Configuration ==========
-MAX_RUNTIME_SECONDS = 90 * 60
-HEARTBEAT_INTERVAL = 300
+MAX_RUNTIME_SECONDS = 29.5 * 60  # 29.5 minutes = 1770 seconds
+HEARTBEAT_INTERVAL = 60
 REQUEST_TIMEOUT = 15
 PER_PAGE = 30
 SEARCH_WORKERS = 4
@@ -60,9 +60,9 @@ pending_batches: Dict[int, List[Tuple]] = defaultdict(list)
 batch_locks: Dict[int, Lock] = {}
 pending_count: Dict[int, int] = defaultdict(int)
 
-# 已回复的记录（内存缓存）
-replied_issues: set = set()
-replied_lock = Lock()
+# 已处理的记录
+processed_sources: set = set()
+processed_lock = Lock()
 
 # ========== Key 正则 ==========
 KEY_PATTERNS = {
@@ -212,7 +212,7 @@ print_lock = Lock()
 def check_timeout():
     elapsed = time.time() - start_time
     if elapsed >= MAX_RUNTIME_SECONDS:
-        print(f"\n[!] Max runtime reached. Exiting.")
+        print(f"\n[!] Max runtime reached ({MAX_RUNTIME_SECONDS}s / 29.5 min). Exiting.")
         save_final_results()
         sys.exit(0)
     return elapsed
@@ -222,7 +222,8 @@ def heartbeat():
     now = time.time()
     if now - last_heartbeat >= HEARTBEAT_INTERVAL:
         elapsed = now - start_time
-        print(f"[❤️] Alive: {elapsed:.0f}s / {MAX_RUNTIME_SECONDS}s")
+        remaining = MAX_RUNTIME_SECONDS - elapsed
+        print(f"[❤️] Alive: {elapsed:.0f}s / {MAX_RUNTIME_SECONDS}s (remaining: {remaining:.0f}s)")
         last_heartbeat = now
 
 def signal_handler(sig, frame):
@@ -268,87 +269,56 @@ def build_reply(author, service, key, info, source_url, source_type):
 ---
 {BOT_SIGNATURE}"""
 
-# ========== 智能回复函数（带重复检查） ==========
-def smart_reply(g, key, service, info, source_url, source_type, author):
-    """
-    智能回复：
-    - Issue 来源：直接回复原 Issue（检查 Bot 是否已回复过）
-    - Code/Commit 来源：在自己的仓库创建 Issue（检查是否已存在相同来源的 Issue）
-    """
+# ========== 创建 Issue 到自己的仓库 ==========
+def create_issue_in_my_repo(g, key, service, info, source_url, source_type, author):
+    """所有来源都在自己的仓库创建 Issue"""
     message = build_reply(author, service, key, info, source_url, source_type)
     
-    with replied_lock:
-        if source_url in replied_issues:
-            print(f"    ⏭️ Already processed this source (memory cache), skipping")
+    with processed_lock:
+        if source_url in processed_sources:
+            print(f"    ⏭️ Already processed this source, skipping")
             return
-        replied_issues.add(source_url)
+        processed_sources.add(source_url)
     
-    if "issue" in source_type:
-        # 直接回复原 Issue
+    try:
+        my_repo = g.get_repo(REPO_NAME)
+        
+        # 检查是否已经存在相同来源 URL 的 Issue
+        already_exists = False
+        existing_issue_num = None
         try:
-            parts = source_url.replace("https://github.com/", "").split("/issues/")
-            if len(parts) != 2:
-                print(f"    ❌ Failed to parse issue URL: {source_url}")
-                return
-            repo_path = parts[0]
-            issue_num = int(parts[1])
-            
-            repo = g.get_repo(repo_path)
-            issue = repo.get_issue(number=issue_num)
-            
-            # 检查 Bot 是否已经回复过此 Issue
-            bot_login = g.get_user().login
-            already_replied = False
-            try:
-                comments = issue.get_comments()
-                for comment in comments:
-                    if comment.user.login == bot_login and "API Key Leak Detected" in comment.body:
-                        already_replied = True
-                        break
-            except Exception as e:
-                print(f"    ⚠️ Failed to check comments: {e}")
-            
-            if already_replied:
-                print(f"    ⏭️ Already replied to issue #{issue_num}, skipping")
-                return
-            
-            issue.create_comment(message)
-            print(f"    📝 Replied to issue #{issue_num} in {repo_path}")
+            issues = my_repo.get_issues(state="all", labels=["leak", "security"])
+            for issue in issues:
+                if source_url in issue.body:
+                    already_exists = True
+                    existing_issue_num = issue.number
+                    break
         except Exception as e:
-            print(f"    ❌ Failed to reply to issue: {e}")
-    else:
-        # Code/Commit 来源，在自己的仓库创建 Issue
-        try:
-            my_repo = g.get_repo(REPO_NAME)
-            
-            # 检查是否已经存在相同来源 URL 的 Issue
-            already_exists = False
-            existing_issue_num = None
-            try:
-                issues = my_repo.get_issues(state="all", labels=["leak", "security"])
-                for issue in issues:
-                    if source_url in issue.body:
-                        already_exists = True
-                        existing_issue_num = issue.number
-                        break
-            except Exception as e:
-                print(f"    ⚠️ Failed to check existing issues: {e}")
-            
-            if already_exists:
-                print(f"    ⏭️ Issue #{existing_issue_num} already exists for this source, skipping")
-                return
-            
-            # 生成简洁的标题
-            short_url = source_url.replace("https://github.com/", "")
-            if len(short_url) > 60:
-                short_url = short_url[:57] + "..."
-            
-            issue_title = f"🔴 {service} Key Leak in {source_type}: {short_url}"
-            issue_body = f"""## API Key Leak Detected
+            print(f"    ⚠️ Failed to check existing issues: {e}")
+        
+        if already_exists:
+            print(f"    ⏭️ Issue #{existing_issue_num} already exists for this source, skipping")
+            return
+        
+        # 生成简洁的标题
+        short_url = source_url.replace("https://github.com/", "")
+        if len(short_url) > 60:
+            short_url = short_url[:57] + "..."
+        
+        # 判断是 PR 还是 Issue 还是其他
+        if "/pull/" in source_url:
+            display_type = "Pull Request"
+        elif "/issues/" in source_url:
+            display_type = "Issue"
+        else:
+            display_type = source_type
+        
+        issue_title = f"🔴 {service} Key Leak in {display_type}: {short_url}"
+        issue_body = f"""## API Key Leak Detected
 
 | Field | Value |
 |-------|-------|
-| **Source Type** | {source_type} |
+| **Source Type** | {display_type} |
 | **Source URL** | {source_url} |
 | **Service** | `{service}` |
 | **Key Preview** | `{key[:20]}...` |
@@ -357,7 +327,7 @@ def smart_reply(g, key, service, info, source_url, source_type, author):
 
 ---
 
-### Original Message
+### Details
 
 {message}
 
@@ -365,10 +335,10 @@ def smart_reply(g, key, service, info, source_url, source_type, author):
 
 *Auto-generated by {BOT_NAME}*
 """
-            new_issue = my_repo.create_issue(title=issue_title, body=issue_body, labels=["security", "leak"])
-            print(f"    📝 Created issue #{new_issue.number} in {REPO_NAME}")
-        except Exception as e:
-            print(f"    ❌ Failed to create issue: {e}")
+        new_issue = my_repo.create_issue(title=issue_title, body=issue_body, labels=["security", "leak"])
+        print(f"    📝 Created issue #{new_issue.number} in {REPO_NAME}")
+    except Exception as e:
+        print(f"    ❌ Failed to create issue: {e}")
 
 # ========== 验证批次 ==========
 def verify_batch(worker_id, batch, g):
@@ -412,8 +382,8 @@ def verify_batch(worker_id, batch, g):
                     with open("valid_keys_realtime.txt", "a") as f:
                         f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | {service} | {key} | {info} | {source_url}\n")
                     
-                    # 智能回复（带重复检查）
-                    smart_reply(g, key, service, info, source_url, source_type, author)
+                    # 创建 Issue 到自己的仓库
+                    create_issue_in_my_repo(g, key, service, info, source_url, source_type, author)
                     
                 else:
                     print(f"  ❌ [{service}] {key[:25]}... -> {info}")
@@ -473,7 +443,6 @@ def search_code_worker(worker_id, start_page, g):
             
             items = data.get("items", []) if isinstance(data, dict) else []
             
-            # 空结果检测
             if not items:
                 consecutive_empty += 1
                 if consecutive_empty >= 3:
@@ -539,7 +508,6 @@ def search_issues_worker(worker_id, start_page, g):
             
             items = data.get("items", []) if isinstance(data, dict) else []
             
-            # 空结果检测
             if not items:
                 consecutive_empty += 1
                 if consecutive_empty >= 3:
@@ -576,7 +544,7 @@ def search_issues_worker(worker_id, start_page, g):
             page += 1
             time.sleep(0.5)
         except Exception as e:
-            safe_print(f"[Worker-{worker_id}] ISSUE error: {e}")
+            safe_print(f("[Worker-{worker_id}] ISSUE error: {e}")
             page += 1
             time.sleep(5)
             continue
@@ -611,7 +579,6 @@ def search_commits_worker(worker_id, start_page, g):
             
             items = data.get("items", []) if isinstance(data, dict) else []
             
-            # 空结果检测
             if not items:
                 consecutive_empty += 1
                 if consecutive_empty >= 3:
@@ -659,13 +626,11 @@ def search_commits_worker(worker_id, start_page, g):
 # ========== 主函数 ==========
 def main():
     print("=" * 70)
-    print("🤖 API Key Leak Scanner - Infinite Scroll Version")
+    print("🤖 API Key Leak Scanner - Final Version")
+    print(f"📁 Target repo: {REPO_NAME}")
+    print(f"⏱️  Max runtime: {MAX_RUNTIME_SECONDS}s (29.5 minutes)")
     print("📊 Scanning: CODE + ISSUES + COMMITS (infinite pages)")
-    print("📊 Supports: OpenAI(sk-proj-), OpenRouter, DeepSeek, Gemini, Anthropic, Replicate, HuggingFace, MiMo")
-    print("📊 Reply Strategy:")
-    print("   - Issue leak: Reply directly in the original issue (check if already replied)")
-    print(f"   - Code/Commit leak: Create issue in {REPO_NAME} (check if already exists)")
-    print("📊 Stops when: 3 consecutive empty pages OR 1.5 hour timeout OR Ctrl+C")
+    print("📊 All leaks create issues in Dont-Be-Stupid-Leaker")
     print("=" * 70)
     
     g = get_github_client()
@@ -673,12 +638,7 @@ def main():
         print("❌ Failed to initialize GitHub client")
         return
     
-    # 获取 Bot 用户名用于后续检查
-    try:
-        bot_user = g.get_user().login
-        print(f"✅ Bot identity: {bot_user}\n")
-    except:
-        print("⚠️ Could not get bot username\n")
+    print("✅ GitHub client initialized\n")
     
     with ThreadPoolExecutor(max_workers=SEARCH_WORKERS) as executor:
         futures = [
@@ -694,6 +654,7 @@ def main():
                 pass
     
     print(f"\n✅ Scan completed. Found {len(found_valid_keys)} valid keys.")
+    print(f"📝 All issues created in: https://github.com/{REPO_NAME}/issues")
 
 if __name__ == "__main__":
     try:
