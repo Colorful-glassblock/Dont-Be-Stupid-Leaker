@@ -5,10 +5,15 @@ on:
     - cron: '0 * * * *'
   workflow_dispatch:
 
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 95
     
     steps:
       - name: Checkout repository
@@ -29,4 +34,12 @@ jobs:
           APP_ID: ${{ secrets.APP_ID }}
           PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
           INSTALLATION_ID: ${{ secrets.INSTALLATION_ID }}
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: python .github/scripts/scan_keys.py
+      
+      - name: Upload scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-results
+          path: valid_keys_*.txt
