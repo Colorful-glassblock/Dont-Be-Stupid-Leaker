@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-API Key Leak Scanner - Stable Version
-Supports: GitHub App + PAT fallback, OpenRouter, sk-proj-, 1.5h timeout
+API Key Leak Scanner - Full Version with Source Tracking
+Supports: Code + Issues + Commits
 """
 
 import os
@@ -23,16 +23,15 @@ from typing import Optional, List, Tuple, Dict, Any
 from github import Github, Auth, GithubException
 
 # ========== Configuration ==========
-MAX_RUNTIME_SECONDS = 90 * 60  # 1.5 hours
+MAX_RUNTIME_SECONDS = 90 * 60
 HEARTBEAT_INTERVAL = 300
 REQUEST_TIMEOUT = 15
 PER_PAGE = 30
-MAX_PAGES = 50
-SEARCH_WORKERS = 3
+MAX_PAGES = 30
+SEARCH_WORKERS = 4
 VERIFY_WORKERS = 30
 BATCH_SIZE = 30
 
-# GitHub App 配置 (从环境变量读取)
 APP_ID = os.environ.get("APP_ID")
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY")
 INSTALLATION_ID = os.environ.get("INSTALLATION_ID")
@@ -43,17 +42,13 @@ BOT_NAME = "LLMApiCheckBot"
 BOT_SIGNATURE = f"*This message was sent by {BOT_NAME} - Repository: {REPO_NAME}*"
 
 GITHUB_API = "https://api.github.com"
-ISSUE_QUERY = '"your key leak"'
-COMMIT_QUERY = 'sk-'
+
+# 搜索条件
+ISSUE_QUERY = '"your key leak" OR "sk-" OR "sk-proj-" OR "AIza" OR "sk-ant-api"'
+COMMIT_QUERY = 'sk- OR sk-proj- OR AIza OR sk-ant-api'
+CODE_QUERY = 'sk- OR sk-proj- OR AIza OR sk-ant-api'
 
 STATE_FILE = "replied_state.json"
-
-scan_results = {
-    "scan_time": datetime.now().isoformat(),
-    "found_keys": [],
-    "replied_count": 0,
-    "errors": []
-}
 
 start_time = time.time()
 last_heartbeat = start_time
@@ -64,7 +59,7 @@ pending_batches: Dict[int, List[Tuple]] = defaultdict(list)
 batch_locks: Dict[int, Lock] = {}
 pending_count: Dict[int, int] = defaultdict(int)
 
-# ========== 多供应商 Key 正则 (Cohere 已移除) ==========
+# ========== Key 正则 ==========
 KEY_PATTERNS = {
     "OpenAI": re.compile(r"sk-proj-[a-zA-Z0-9]{32,}"),
     "OpenAI_Legacy": re.compile(r"sk-[a-zA-Z0-9]{32,}"),
@@ -88,15 +83,13 @@ def _parse_deepseek(code, data):
         usd = sum(float(i.get("total_balance", 0)) for i in data.get("balance_infos", []) if i.get("currency") == "USD")
         info = f"💰 CNY: {cny:.2f}, USD: {usd:.2f}" if cny or usd else "Valid (no balance)"
         return True, cny + usd * 7.2, info
-    return False, 0, "Invalid or expired"
+    return False, 0, "Invalid"
 
 def _parse_openai(code, data):
     if code == 200:
         return True, 0, "Valid"
     if code == 401:
-        return False, 0, "Invalid key"
-    if code == 429:
-        return False, 0, "Rate limited"
+        return False, 0, "Invalid"
     return False, 0, f"HTTP {code}"
 
 def _parse_openrouter(code, data):
@@ -109,11 +102,25 @@ def _parse_openrouter(code, data):
     return False, 0, f"HTTP {code}"
 
 def _parse_gemini(code, data):
+    """
+    Gemini API 验证
+    200: 完全有效
+    403: Key 有效但受限制（IP/地域/billing），仍视为有效
+    400: 可能是格式问题，也可能是 key 无效
+    """
     if code == 200:
-        return True, 0, "Valid"
+        return True, 0, "✅ Valid"
+    if code == 403:
+        return True, 0, "⚠️ Valid but restricted (IP/region/billing)"
     if code == 400:
-        return False, 0, "Invalid format"
-    return False, 0, f"HTTP {code}"
+        if isinstance(data, dict) and "API key not valid" in str(data):
+            return False, 0, "❌ Invalid key"
+        return True, 0, "⚠️ Possibly valid (check billing)"
+    if code == 404:
+        return False, 0, "❌ Invalid (not found)"
+    if code == 429:
+        return True, 0, "⚠️ Rate limited (key may be valid)"
+    return False, 0, f"❌ HTTP {code}"
 
 def _parse_anthropic(code, data):
     if code == 200:
@@ -154,7 +161,6 @@ VERIFIERS = {
 # ========== GitHub 认证 ==========
 def get_github_client():
     token = None
-    
     if APP_ID and PRIVATE_KEY and INSTALLATION_ID:
         try:
             payload = {"iat": int(time.time()), "exp": int(time.time()) + 600, "iss": APP_ID}
@@ -167,15 +173,12 @@ def get_github_client():
                 print("✅ Using GitHub App authentication")
         except Exception as e:
             print(f"⚠️ GitHub App auth failed: {e}")
-    
     if not token and PAT_TOKEN:
         token = PAT_TOKEN
         print("✅ Using PAT authentication")
-    
     if not token:
         print("❌ No authentication method available")
         return None
-    
     auth = Auth.Token(token)
     return Github(auth=auth)
 
@@ -210,8 +213,7 @@ print_lock = Lock()
 def check_timeout():
     elapsed = time.time() - start_time
     if elapsed >= MAX_RUNTIME_SECONDS:
-        print(f"\n[!] Max runtime reached ({MAX_RUNTIME_SECONDS}s). Exiting.")
-        save_final_results()
+        print(f"\n[!] Max runtime reached. Exiting.")
         sys.exit(0)
     return elapsed
 
@@ -220,26 +222,13 @@ def heartbeat():
     now = time.time()
     if now - last_heartbeat >= HEARTBEAT_INTERVAL:
         elapsed = now - start_time
-        remaining = MAX_RUNTIME_SECONDS - elapsed
-        print(f"[❤️] Alive: {elapsed:.0f}s / {MAX_RUNTIME_SECONDS}s (remaining: {remaining:.0f}s)")
+        print(f"[❤️] Alive: {elapsed:.0f}s / {MAX_RUNTIME_SECONDS}s")
         last_heartbeat = now
-
-def save_final_results():
-    with valid_lock:
-        if found_valid_keys:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            with open(f"valid_keys_final_{timestamp}.txt", "w") as f:
-                f.write(f"# Scan time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"# Total valid keys: {len(found_valid_keys)}\n\n")
-                for key, service, balance, info, source_url, _, _ in found_valid_keys:
-                    f.write(f"{service} | {key} | {info} | {source_url}\n")
-            print(f"\n💾 Saved {len(found_valid_keys)} keys to valid_keys_final_{timestamp}.txt")
 
 def signal_handler(sig, frame):
     print("\n\n⚠️ Interrupted, saving results...")
     stop_event.set()
     time.sleep(2)
-    save_final_results()
     sys.exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
@@ -284,12 +273,14 @@ def verify_batch(worker_id, batch):
                 key, service, valid, balance, info, source_url, source_type, author = future.result(timeout=15)
                 if valid:
                     print(f"  ✅ [{service}] {key[:25]}... -> {info}")
+                    print(f"     📍 Source: {source_url}")
                     with valid_lock:
                         found_valid_keys.append((key, service, balance, info, source_url, source_type, datetime.now()))
                     with open("valid_keys_realtime.txt", "a") as f:
                         f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | {service} | {key} | {info} | {source_url}\n")
                 else:
                     print(f"  ❌ [{service}] {key[:25]}... -> {info}")
+                    print(f"     📍 Source: {source_url}")
             except Exception as e:
                 print(f"  ❌ Exception: {e}")
 
@@ -314,124 +305,135 @@ def extract_and_queue(text, source_url, source_type, worker_id, author):
             with valid_lock:
                 if any(key == k for k, _, _, _, _, _, _ in found_valid_keys):
                     continue
+            # 打印发现的 Key 及其出处
+            print(f"  🔑 Found {service} key in {source_type}: {source_url[:80]}...")
             add_key_to_pending(worker_id, key, service, source_url, source_type, author)
 
-def process_item(item, item_type, worker_id):
-    if item_type == "issue":
-        url = item.get("html_url", "")
-        title = item.get("title", "")
-        body = item.get("body", "") or ""
-        author = item.get("user", {}).get("login", "unknown")
-        full_text = title + "\n" + body
-        try:
-            comments_url = item.get("comments_url", "")
-            if comments_url:
-                code, data = _http_request(comments_url, headers=_gh_headers(), timeout=10)
-                if code == 200 and isinstance(data, list):
-                    for comment in data:
-                        full_text += f"\n{comment.get('body', '')}"
-        except:
-            pass
-    else:
-        url = item.get("html_url", "")
-        message = item.get("commit", {}).get("message", "")
-        author = item.get("author", {}).get("login", "unknown") if item.get("author") else "unknown"
-        full_text = message
-        try:
-            diff_url = url.replace("github.com", "api.github.com/repos")
-            diff_url = diff_url.replace("/commit/", "/commits/")
-            code, data = _http_request(diff_url, headers=_gh_headers(), timeout=10)
-            if code == 200 and isinstance(data, dict):
-                for f in data.get("files", []):
-                    patch = f.get("patch", "")
-                    if patch:
-                        full_text += "\n" + patch
-        except:
-            pass
-    
-    if len(full_text) > 50000:
-        full_text = full_text[:50000]
-    
-    extract_and_queue(full_text, url, item_type, worker_id, author)
-
-# ========== 搜索 Worker ==========
-def search_worker(worker_id, search_type, start_page):
-    safe_print(f"\n[Worker-{worker_id}] 🚀 Starting {search_type} scan from page {start_page}")
-    query = ISSUE_QUERY if search_type == "issue" else COMMIT_QUERY
-    api_path = "issues" if search_type == "issue" else "commits"
-    encoded = urllib.parse.quote(query)
+# ========== Code 搜索 ==========
+def search_code_worker(worker_id, start_page):
+    safe_print(f"\n[Worker-{worker_id}] 🚀 Starting CODE scan from page {start_page}")
     page = start_page
     items_processed = 0
-    consecutive_empty = 0
     
     while not stop_event.is_set() and page <= MAX_PAGES:
         check_timeout()
         heartbeat()
         
-        url = f"{GITHUB_API}/search/{api_path}?q={encoded}&sort=created&order=desc&per_page={PER_PAGE}&page={page}"
+        url = f"{GITHUB_API}/search/code?q={urllib.parse.quote(CODE_QUERY)}&sort=indexed&order=desc&per_page={PER_PAGE}&page={page}"
         try:
             code, data = _http_request(url, headers=_gh_headers(), timeout=REQUEST_TIMEOUT)
-            
-            if code == 403:
-                safe_print(f"[Worker-{worker_id}] ⚠️ {search_type} page {page}: HTTP 403, waiting 60s...")
-                time.sleep(60)
-                continue
-            
             if code != 200:
-                safe_print(f"[Worker-{worker_id}] {search_type} page {page}: HTTP {code}, continuing")
+                safe_print(f"[Worker-{worker_id}] CODE page {page}: HTTP {code}")
                 page += 1
                 time.sleep(2)
                 continue
-            
-            if not isinstance(data, dict):
-                page += 1
-                continue
-            
-            items = data.get("items", [])
-            
+            items = data.get("items", []) if isinstance(data, dict) else []
             if not items:
-                consecutive_empty += 1
-                if consecutive_empty >= 5:
-                    safe_print(f"[Worker-{worker_id}] 📭 {search_type} no more results, stopping")
-                    break
-                page += 1
-                time.sleep(1)
-                continue
-            
-            consecutive_empty = 0
-            
-            safe_print(f"[Worker-{worker_id}] 📄 {search_type} page {page}: {len(items)} items (total: {items_processed + len(items)})")
-            
+                break
+            safe_print(f"[Worker-{worker_id}] 📄 CODE page {page}: {len(items)} items")
             for item in items:
                 if stop_event.is_set():
                     break
-                process_item(item, search_type, worker_id)
+                raw_url = item.get("html_url", "").replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
+                author = item.get("repository", {}).get("owner", {}).get("login", "unknown")
+                try:
+                    resp = requests.get(raw_url, timeout=10)
+                    if resp.status_code == 200:
+                        extract_and_queue(resp.text, item.get("html_url", ""), "code", worker_id, author)
+                except:
+                    pass
                 items_processed += 1
-            
             page += 1
             time.sleep(0.5)
-            
         except Exception as e:
-            safe_print(f"[Worker-{worker_id}] ❌ Error on page {page}: {e}")
+            safe_print(f"[Worker-{worker_id}] CODE error: {e}")
             page += 1
             time.sleep(5)
-            continue
+    safe_print(f"[Worker-{worker_id}] CODE scan finished, processed {items_processed} files")
+
+# ========== Issues 搜索 ==========
+def search_issues_worker(worker_id, start_page):
+    safe_print(f"\n[Worker-{worker_id}] 🚀 Starting ISSUE scan from page {start_page}")
+    query = ISSUE_QUERY
+    page = start_page
+    items_processed = 0
     
-    with batch_locks.get(worker_id, Lock()):
-        if pending_count.get(worker_id, 0) > 0:
-            batch = pending_batches.get(worker_id, []).copy()
-            if batch:
-                safe_print(f"[Worker-{worker_id}] 📦 Processing remaining {len(batch)} keys")
-                verify_batch(worker_id, batch)
+    while not stop_event.is_set() and page <= MAX_PAGES:
+        check_timeout()
+        heartbeat()
+        
+        url = f"{GITHUB_API}/search/issues?q={urllib.parse.quote(query)}&sort=created&order=desc&per_page={PER_PAGE}&page={page}"
+        try:
+            code, data = _http_request(url, headers=_gh_headers(), timeout=REQUEST_TIMEOUT)
+            if code != 200:
+                safe_print(f"[Worker-{worker_id}] ISSUE page {page}: HTTP {code}")
+                page += 1
+                time.sleep(2)
+                continue
+            items = data.get("items", []) if isinstance(data, dict) else []
+            if not items:
+                break
+            safe_print(f"[Worker-{worker_id}] 📄 ISSUE page {page}: {len(items)} items")
+            for item in items:
+                if stop_event.is_set():
+                    break
+                title = item.get("title", "")
+                body = item.get("body", "") or ""
+                author = item.get("user", {}).get("login", "unknown")
+                full_text = title + "\n" + body
+                extract_and_queue(full_text, item.get("html_url", ""), "issue", worker_id, author)
+                items_processed += 1
+            page += 1
+            time.sleep(0.5)
+        except Exception as e:
+            safe_print(f"[Worker-{worker_id}] ISSUE error: {e}")
+            page += 1
+            time.sleep(5)
+    safe_print(f"[Worker-{worker_id}] ISSUE scan finished, processed {items_processed} items")
+
+# ========== Commits 搜索 ==========
+def search_commits_worker(worker_id, start_page):
+    safe_print(f"\n[Worker-{worker_id}] 🚀 Starting COMMIT scan from page {start_page}")
+    page = start_page
+    items_processed = 0
     
-    safe_print(f"[Worker-{worker_id}] 🏁 Finished, processed {items_processed} items")
+    while not stop_event.is_set() and page <= MAX_PAGES:
+        check_timeout()
+        heartbeat()
+        
+        url = f"{GITHUB_API}/search/commits?q={urllib.parse.quote(COMMIT_QUERY)}&sort=committer-date&order=desc&per_page={PER_PAGE}&page={page}"
+        try:
+            code, data = _http_request(url, headers=_gh_headers(), timeout=REQUEST_TIMEOUT)
+            if code != 200:
+                safe_print(f"[Worker-{worker_id}] COMMIT page {page}: HTTP {code}")
+                page += 1
+                time.sleep(2)
+                continue
+            items = data.get("items", []) if isinstance(data, dict) else []
+            if not items:
+                break
+            safe_print(f"[Worker-{worker_id}] 📄 COMMIT page {page}: {len(items)} items")
+            for item in items:
+                if stop_event.is_set():
+                    break
+                message = item.get("commit", {}).get("message", "")
+                author = item.get("author", {}).get("login", "unknown") if item.get("author") else "unknown"
+                extract_and_queue(message, item.get("html_url", ""), "commit", worker_id, author)
+                items_processed += 1
+            page += 1
+            time.sleep(0.5)
+        except Exception as e:
+            safe_print(f"[Worker-{worker_id}] COMMIT error: {e}")
+            page += 1
+            time.sleep(5)
+    safe_print(f"[Worker-{worker_id}] COMMIT scan finished, processed {items_processed} items")
 
 # ========== 主函数 ==========
 def main():
     print("=" * 70)
-    print("🤖 API Key Leak Scanner - Stable Version")
-    print(f"📊 Supports: OpenAI(sk-proj-), OpenRouter, DeepSeek, Gemini, Anthropic, Replicate, HuggingFace, MiMo")
-    print(f"⚙️  Batch size: {BATCH_SIZE} | Max pages: {MAX_PAGES} | Max runtime: {MAX_RUNTIME_SECONDS}s (1.5h)")
+    print("🤖 API Key Leak Scanner - Full Version with Source Tracking")
+    print("📊 Scanning: CODE + ISSUES + COMMITS")
+    print("📊 Supports: OpenAI(sk-proj-), OpenRouter, DeepSeek, Gemini, Anthropic, Replicate, HuggingFace, MiMo")
     print("=" * 70)
     
     g = get_github_client()
@@ -441,9 +443,10 @@ def main():
     
     with ThreadPoolExecutor(max_workers=SEARCH_WORKERS) as executor:
         futures = [
-            executor.submit(search_worker, 1, "issue", 1),
-            executor.submit(search_worker, 2, "issue", 6),
-            executor.submit(search_worker, 3, "commit", 1)
+            executor.submit(search_code_worker, 1, 1),
+            executor.submit(search_issues_worker, 2, 1),
+            executor.submit(search_commits_worker, 3, 1),
+            executor.submit(search_issues_worker, 4, 6),
         ]
         for future in as_completed(futures):
             try:
@@ -451,7 +454,6 @@ def main():
             except:
                 pass
     
-    save_final_results()
     print(f"\n✅ Scan completed. Found {len(found_valid_keys)} valid keys.")
 
 if __name__ == "__main__":
@@ -459,5 +461,4 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         print(f"❌ Fatal error: {e}")
-        save_final_results()
         sys.exit(1)
