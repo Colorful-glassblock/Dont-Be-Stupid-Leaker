@@ -15,6 +15,7 @@ import requests
 MAX_RUNTIME_SECONDS = 90 * 60
 HEARTBEAT_INTERVAL = 300
 BATCH_DELAY = 10
+MAX_REPOS_PER_BATCH = 30
 
 PAT_TOKEN = os.environ.get("PAT_TOKEN")
 if not PAT_TOKEN:
@@ -24,18 +25,6 @@ if not PAT_TOKEN:
 REPO_NAME = os.environ.get("GITHUB_REPOSITORY", "Colorful-glassblock/Dont-Be-Stupid-Leaker")
 BOT_NAME = "LLMApiCheckBot"
 BOT_SIGNATURE = f"*This message was sent by {BOT_NAME} - Repository: {REPO_NAME}*"
-
-# 搜索范围扩大
-SEARCH_QUERIES = [
-    '"your key leak"',
-    'sk-',
-    'sk-proj-',
-    'AIza',
-    'sk-ant-api',
-    'r8_',
-    'hf_',
-    'tp-',
-]
 
 STATE_FILE = "replied_state.json"
 
@@ -48,8 +37,6 @@ scan_results = {
 
 start_time = time.time()
 last_heartbeat = start_time
-
-# 已处理的仓库集合
 processed_repos: Set[str] = set()
 
 def signal_handler(sig, frame):
@@ -83,13 +70,12 @@ def load_state():
     try:
         with open(STATE_FILE, "r") as f:
             state = json.load(f)
-            # 兼容旧状态
             if "processed_repos" not in state:
                 state["processed_repos"] = []
             return state
     except:
         return {"replied_commits": [], "replied_codes": [], "replied_issues": [], 
-                "processed_repos": [], "last_repo_page": 0}
+                "processed_repos": [], "repo_index": 0}
 
 def save_state(state=None):
     if state is None:
@@ -232,18 +218,28 @@ def save_result():
         json.dump(scan_results, f, indent=2)
     print(f"💾 Saved to {fname}")
 
-def get_repo_batch(g, page):
-    """获取仓库列表，按更新时间排序"""
-    try:
-        results = g.search_repositories("", sort="updated", order="desc")
-        items = results.get_page(page)
-        return items
-    except GithubException as e:
-        print(f"  Repo search error: {e}")
-        return []
-    except Exception as e:
-        print(f"  Repo search error: {e}")
-        return []
+def get_recent_repos_from_code(g, limit=100):
+    """通过搜索 key 模式获取最近有相关代码的仓库（去重）"""
+    repos = {}
+    patterns = ["sk-", "sk-proj-", "AIza", "sk-ant-api", "r8_", "hf_", "tp-"]
+    
+    for pattern in patterns:
+        try:
+            # 搜索代码并限制结果数量
+            query = f"{pattern}"
+            code_results = list(g.search_code(query))[:limit // len(patterns)]
+            for code in code_results:
+                repo_full_name = code.repository.full_name
+                if repo_full_name not in repos:
+                    repos[repo_full_name] = code.repository.updated_at
+        except Exception as e:
+            print(f"  Search error for {pattern}: {e}")
+            continue
+        time.sleep(0.5)
+    
+    # 按更新时间排序，最新的在前面
+    sorted_repos = sorted(repos.items(), key=lambda x: x[1], reverse=True)
+    return [repo[0] for repo in sorted_repos[:limit]]
 
 def scan_single_repo(g, repo_full_name, state, processed):
     """扫描单个仓库的全部内容"""
@@ -257,7 +253,7 @@ def scan_single_repo(g, repo_full_name, state, processed):
     
     replied_count = 0
     
-    # 1. 扫描仓库中的代码文件 (使用 code search 限定 repo)
+    # 1. 扫描仓库中的代码文件
     print(f"    🔍 Scanning code files...")
     try:
         code_query = f"repo:{repo_full_name} sk- OR sk-proj- OR AIza OR sk-ant-api OR r8_ OR hf_ OR tp-"
@@ -339,6 +335,13 @@ def scan_single_repo(g, repo_full_name, state, processed):
             body = issue.body or ""
             full_text = f"{title}\n{body}"
             
+            # 获取评论
+            try:
+                for c in issue.get_comments():
+                    full_text += f"\n{c.body or ''}"
+            except:
+                pass
+            
             for service, pattern in KEY_PATTERNS.items():
                 for m in pattern.finditer(full_text):
                     key = m.group(0)
@@ -359,6 +362,9 @@ def scan_single_repo(g, repo_full_name, state, processed):
                                 line_num = i + 1
                                 line_content = l.strip()[:200]
                                 break
+                    else:
+                        loc = "issue comment"
+                        line_content = key[:200]
                     
                     valid, bal, info = verify_key(service, key)
                     if valid:
@@ -462,48 +468,23 @@ def scan_single_repo(g, repo_full_name, state, processed):
     
     return replied_count
 
-def scan_repos_batch(g, state, processed, page):
-    """扫描一批仓库"""
-    print(f"\n  📦 Fetching repositories page {page}...")
-    repos = get_repo_batch(g, page)
-    total = len(repos)
+def get_next_batch_of_repos(g, state):
+    """获取下一批仓库"""
+    repo_index = state.get("repo_index", 0)
     
-    if total == 0:
-        print(f"  No more repositories")
-        return 0, page + 1, False
+    # 每批获取新仓库
+    all_repos = get_recent_repos_from_code(g, limit=200)
     
-    print(f"  Found {total} repositories on page {page}")
-    replied_this_batch = 0
+    # 过滤已处理的
+    processed = set(state.get("processed_repos", []))
+    new_repos = [r for r in all_repos if r not in processed and r != REPO_NAME]
     
-    for idx, repo in enumerate(repos):
-        heartbeat()
-        check_timeout()
-        
-        repo_full_name = repo.full_name
-        
-        # 跳过自己的仓库
-        if repo_full_name == REPO_NAME:
-            continue
-        
-        # 检查是否已处理过
-        if repo_full_name in state.get("processed_repos", []):
-            continue
-        
-        print(f"\n    [{idx+1}/{total}] Scanning {repo_full_name}...")
-        
-        replied = scan_single_repo(g, repo_full_name, state, processed)
-        replied_this_batch += replied
-        
-        # 标记已处理
-        if "processed_repos" not in state:
-            state["processed_repos"] = []
-        if repo_full_name not in state["processed_repos"]:
-            state["processed_repos"].append(repo_full_name)
-        save_state(state)
-        
-        time.sleep(0.5)
+    batch = new_repos[repo_index:repo_index + MAX_REPOS_PER_BATCH]
     
-    return replied_this_batch, page + 1, True
+    # 更新索引
+    state["repo_index"] = repo_index + len(batch)
+    
+    return batch
 
 def check_and_reply():
     global last_heartbeat
@@ -512,7 +493,7 @@ def check_and_reply():
     print(f"🤖 LLMApiCheckBot - API Key Leak Scanner")
     print(f"📁 Self repository: {REPO_NAME}")
     print(f"⏱️  Max runtime: {MAX_RUNTIME_SECONDS}s (1.5 hours)")
-    print(f"🔍 Scanning: New repositories (priority) + Code + Issues + Commits")
+    print(f"🔍 Scanning: Public repositories with recent key patterns")
     print(f"{'='*60}\n")
     
     state = load_state()
@@ -522,9 +503,6 @@ def check_and_reply():
     print(f"   - Replied issues: {len(state.get('replied_issues', []))}")
     print(f"   - Processed repos: {len(state.get('processed_repos', []))}")
     
-    repo_page = state.get("last_repo_page", 0)
-    print(f"📍 Starting from repository page {repo_page}\n")
-    
     auth = Auth.Token(PAT_TOKEN)
     g = Github(auth=auth)
     
@@ -533,13 +511,6 @@ def check_and_reply():
         print(f"✅ Authenticated as: {user.login}\n")
     except Exception as e:
         print(f"❌ Auth error: {e}")
-        return
-    
-    try:
-        self_repo = g.get_repo(REPO_NAME)
-        print(f"✅ Self repository: {self_repo.full_name}\n")
-    except Exception as e:
-        print(f"❌ Error accessing self repo: {e}")
         return
     
     processed = set()
@@ -552,26 +523,39 @@ def check_and_reply():
         
         print(f"\n{'='*50}")
         print(f"📦 Batch #{batch_count}")
-        print(f"📍 Repository page {repo_page}")
         print(f"{'='*50}")
         
-        # 扫描仓库（优先新仓库）
-        repo_replied, repo_page, repo_has_more = scan_repos_batch(g, state, processed, repo_page)
-        total_replied += repo_replied
-        check_timeout()
+        # 获取下一批仓库
+        repos_to_scan = get_next_batch_of_repos(g, state)
         
-        # 保存进度
-        state["last_repo_page"] = repo_page
-        save_state(state)
-        
-        print(f"\n📊 Batch #{batch_count} summary:")
-        print(f"   ✅ Replied from repositories: {repo_replied}")
-        print(f"   📈 Total replied so far: {total_replied}")
-        print(f"   📊 Total keys found: {len(scan_results['found_keys'])}")
-        
-        if not repo_has_more:
+        if not repos_to_scan:
             print(f"\n✅ No more repositories to scan.")
             break
+        
+        print(f"📁 Scanning {len(repos_to_scan)} repositories...")
+        
+        batch_replied = 0
+        for repo_full_name in repos_to_scan:
+            heartbeat()
+            check_timeout()
+            
+            replied = scan_single_repo(g, repo_full_name, state, processed)
+            batch_replied += replied
+            total_replied += replied
+            
+            # 标记已处理
+            if "processed_repos" not in state:
+                state["processed_repos"] = []
+            if repo_full_name not in state["processed_repos"]:
+                state["processed_repos"].append(repo_full_name)
+            save_state(state)
+            
+            time.sleep(0.5)
+        
+        print(f"\n📊 Batch #{batch_count} summary:")
+        print(f"   ✅ Replied from repositories: {batch_replied}")
+        print(f"   📈 Total replied so far: {total_replied}")
+        print(f"   📊 Total keys found: {len(scan_results['found_keys'])}")
         
         print(f"\n💤 Waiting {BATCH_DELAY} seconds before next batch...")
         for i in range(BATCH_DELAY):
@@ -591,8 +575,6 @@ def check_and_reply():
         for i, key_info in enumerate(scan_results['found_keys'], 1):
             print(f"   {i}. [{key_info['service']}] {key_info['key']}")
             print(f"      {key_info['info']}")
-            if 'url' in key_info:
-                print(f"      {key_info['url']}")
     
     print(f"{'='*60}")
     save_result()
