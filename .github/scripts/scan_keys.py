@@ -50,9 +50,20 @@ start_time = time.time()
 last_heartbeat = start_time
 stop_scan = False
 
-# 搜索条件 - 直接搜包含 key 的 issues 和 commits
-ISSUE_QUERY = '"sk-" OR "sk-proj-" OR "AIza" OR "sk-ant-api" OR "r8_" OR "hf_" OR "tp-"'
-COMMIT_QUERY = '"sk-" OR "sk-proj-" OR "AIza" OR "sk-ant-api" OR "r8_" OR "hf_" OR "tp-"'
+# 拆分搜索条件 (每个查询最多5个OR，符合GitHub API限制)
+# 加上 "your key leak" 搜索
+ISSUE_QUERIES = [
+    '"your key leak"',
+    '"sk-" OR "sk-proj-" OR "AIza"',
+    '"sk-ant-api" OR "r8_" OR "hf_"',
+    '"tp-"'
+]
+
+COMMIT_QUERIES = [
+    '"sk-" OR "sk-proj-" OR "AIza"',
+    '"sk-ant-api" OR "r8_" OR "hf_"',
+    '"tp-"'
+]
 
 def signal_handler(sig, frame):
     global stop_scan
@@ -256,23 +267,31 @@ def save_result():
     print(f"💾 Saved to {fname}")
 
 def scan_issues_batch(g, state, processed, page):
-    """扫描一批 Issues"""
+    """扫描一批 Issues (使用拆分后的查询)"""
     print(f"\n  📄 Fetching issues page {page}...")
+    all_issues = []
+    seen_urls = set()
     
-    try:
-        issues = list(g.search_issues(ISSUE_QUERY, sort="created", order="desc"))[:BATCH_SIZE]
-    except Exception as e:
-        print(f"    Issue search error: {e}")
-        return 0, page + 1, False
+    for query in ISSUE_QUERIES:
+        try:
+            items = list(g.search_issues(query, sort="created", order="desc"))[:15]
+            for item in items:
+                if item.html_url not in seen_urls:
+                    seen_urls.add(item.html_url)
+                    all_issues.append(item)
+        except Exception as e:
+            print(f"    Issue search error for '{query}': {e}")
+            continue
+        time.sleep(0.3)
     
-    if not issues:
+    if not all_issues:
         print(f"    No issues found")
         return 0, page + 1, False
     
-    print(f"    Found {len(issues)} issues")
+    print(f"    Found {len(all_issues)} unique issues")
     replied = 0
     
-    for issue in issues:
+    for issue in all_issues[:BATCH_SIZE]:
         if stop_scan:
             break
         heartbeat()
@@ -336,23 +355,31 @@ def scan_issues_batch(g, state, processed, page):
     return replied, page + 1, True
 
 def scan_commits_batch(g, state, processed, page):
-    """扫描一批 Commits"""
+    """扫描一批 Commits (使用拆分后的查询)"""
     print(f"\n  📄 Fetching commits page {page}...")
+    all_commits = []
+    seen_urls = set()
     
-    try:
-        commits = list(g.search_commits(COMMIT_QUERY, sort="committer-date", order="desc"))[:BATCH_SIZE]
-    except Exception as e:
-        print(f"    Commit search error: {e}")
-        return 0, page + 1, False
+    for query in COMMIT_QUERIES:
+        try:
+            items = list(g.search_commits(query, sort="committer-date", order="desc"))[:15]
+            for item in items:
+                if item.html_url not in seen_urls:
+                    seen_urls.add(item.html_url)
+                    all_commits.append(item)
+        except Exception as e:
+            print(f"    Commit search error for '{query}': {e}")
+            continue
+        time.sleep(0.3)
     
-    if not commits:
+    if not all_commits:
         print(f"    No commits found")
         return 0, page + 1, False
     
-    print(f"    Found {len(commits)} commits")
+    print(f"    Found {len(all_commits)} unique commits")
     replied = 0
     
-    for commit in commits:
+    for commit in all_commits[:BATCH_SIZE]:
         if stop_scan:
             break
         heartbeat()
@@ -369,9 +396,8 @@ def scan_commits_batch(g, state, processed, page):
         full_text = title + "\n" + msg
         diff = ""
         try:
-            repo = commit.repository
-            if repo:
-                files = repo.get_commit(sha).files
+            if commit.repository:
+                files = commit.repository.get_commit(sha).files
                 for f in files:
                     if f.patch:
                         diff += f.patch + "\n"
