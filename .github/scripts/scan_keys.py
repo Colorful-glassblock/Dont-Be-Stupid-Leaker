@@ -96,35 +96,87 @@ KEY_PATTERNS = {
 }
 
 def _parse_deepseek(code, data):
-    if code != 200 or not isinstance(data, dict) or not data.get("is_available"):
-        return False, 0, "Invalid"
+    """DeepSeek: is_available=True 就是有效，余额为0也算"""
+    if code != 200:
+        return False, 0, f"HTTP {code}"
+    if not isinstance(data, dict):
+        return False, 0, "Invalid response"
+    if not data.get("is_available", False):
+        return False, 0, "Invalid or expired"
     cny = sum(float(i.get("total_balance", 0)) for i in data.get("balance_infos", []) if i.get("currency") == "CNY")
     usd = sum(float(i.get("total_balance", 0)) for i in data.get("balance_infos", []) if i.get("currency") == "USD")
-    info = f"Balance: CNY {cny:.2f}, USD {usd:.2f}" if cny or usd else "Valid"
+    info = f"💰 CNY: {cny:.2f}, USD: {usd:.2f}" if cny or usd else "✅ Valid (no balance)"
     return True, cny + usd * 7.2, info
 
+def _parse_openai(code, data):
+    """OpenAI: 检查是否返回有效的模型列表"""
+    if code != 200:
+        return False, 0, f"HTTP {code}"
+    if not isinstance(data, dict):
+        return False, 0, "Invalid response"
+    models = data.get("data", [])
+    if models and len(models) > 0 and models[0].get("id"):
+        return True, 0, "✅ Valid"
+    return False, 0, "❌ Invalid (test key?)"
+
 def _parse_openrouter(code, data):
-    if code == 200 and isinstance(data, dict):
-        credits = data.get("credits", 0)
-        if credits:
-            return True, float(credits), f"Credits: {credits}"
-        return True, 0, "Valid"
-    return False, 0, "Invalid"
+    """OpenRouter: credits 为0也算有效"""
+    if code != 200:
+        return False, 0, f"HTTP {code}"
+    if not isinstance(data, dict):
+        return False, 0, "Invalid response"
+    credits = data.get("credits", 0)
+    info = f"💰 Credits: {credits}" if credits > 0 else "✅ Valid (no credits)"
+    return True, float(credits), info
+
+def _parse_gemini(code, data):
+    """Gemini: 检查是否返回模型列表"""
+    if code != 200:
+        return False, 0, f"HTTP {code}"
+    if not isinstance(data, dict):
+        return False, 0, "Invalid response"
+    models = data.get("models", [])
+    if models and len(models) > 0:
+        return True, 0, "✅ Valid"
+    return False, 0, "❌ Invalid (test key)"
+
+def _parse_anthropic(code, data):
+    """Anthropic: 200 即为有效"""
+    if code == 200:
+        return True, 0, "✅ Valid"
+    if code == 401:
+        return False, 0, "❌ Invalid key"
+    return False, 0, f"❌ HTTP {code}"
+
+def _parse_replicate(code, data):
+    """Replicate: 200 即为有效"""
+    if code == 200:
+        return True, 0, "✅ Valid"
+    return False, 0, f"❌ HTTP {code}"
+
+def _parse_huggingface(code, data):
+    """HuggingFace: 200 即为有效"""
+    if code == 200:
+        return True, 0, "✅ Valid"
+    return False, 0, f"❌ HTTP {code}"
 
 def _parse_mimo(code, data):
+    """MiMo: balance 为0也算有效"""
     if code == 200 and isinstance(data, dict):
         balance = float(data.get("balance", data.get("credit", 0)))
-        return True, balance, f"Balance: {balance}" if balance else "Valid"
-    return False, 0, "Invalid"
+        info = f"💰 Balance: {balance}" if balance > 0 else "✅ Valid (no balance)"
+        return True, balance, info
+    return False, 0, "❌ Invalid"
 
 VERIFIERS = {
-    "OpenAI": {"url": "https://api.openai.com/v1/models", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": lambda c, d: (c == 200, 0, "Valid")},
+    "OpenAI": {"url": "https://api.openai.com/v1/models", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_openai},
+    "OpenAI_Legacy": {"url": "https://api.openai.com/v1/models", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_openai},
     "OpenRouter": {"url": "https://openrouter.ai/api/v1/auth/key", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_openrouter},
     "DeepSeek": {"url": "https://api.deepseek.com/user/balance", "headers": lambda k: {"Authorization": f"Bearer {k}", "Accept": "application/json"}, "method": "GET", "parse": _parse_deepseek},
-    "Gemini": {"url": lambda k: f"https://generativelanguage.googleapis.com/v1/models?key={k}", "headers": lambda k: {}, "method": "GET", "parse": lambda c, d: (c == 200, 0, "Valid")},
-    "Anthropic": {"url": "https://api.anthropic.com/v1/messages", "headers": lambda k: {"x-api-key": k, "anthropic-version": "2023-06-01", "Content-Type": "application/json"}, "method": "POST", "body": lambda: json.dumps({"model": "claude-3-haiku-20240307", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}).encode(), "parse": lambda c, d: (c == 200, 0, "Valid")},
-    "Replicate": {"url": "https://api.replicate.com/v1/account", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": lambda c, d: (c == 200, 0, "Valid")},
-    "HuggingFace": {"url": "https://huggingface.co/api/whoami", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": lambda c, d: (c == 200, 0, "Valid")},
+    "Gemini": {"url": lambda k: f"https://generativelanguage.googleapis.com/v1/models?key={k}", "headers": lambda k: {}, "method": "GET", "parse": _parse_gemini},
+    "Anthropic": {"url": "https://api.anthropic.com/v1/messages", "headers": lambda k: {"x-api-key": k, "anthropic-version": "2023-06-01", "Content-Type": "application/json"}, "method": "POST", "body": lambda: json.dumps({"model": "claude-3-haiku-20240307", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}).encode(), "parse": _parse_anthropic},
+    "Replicate": {"url": "https://api.replicate.com/v1/account", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_replicate},
+    "HuggingFace": {"url": "https://huggingface.co/api/whoami", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_huggingface},
     "MiMo": {"url": "https://token-plan-cn.xiaomimimo.com/v1/models", "headers": lambda k: {"Authorization": f"Bearer {k}", "X-Plan-Type": "token-plan"}, "method": "GET", "parse": _parse_mimo},
 }
 
@@ -194,7 +246,7 @@ def save_result():
     fname = f"scan_result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     with open(fname, "w") as f:
         json.dump(scan_results, f, indent=2)
-    print(f"Saved to {fname}")
+    print(f"💾 Saved to {fname}")
 
 def get_commit_batch(g, page):
     try:
@@ -204,10 +256,10 @@ def get_commit_batch(g, page):
     except GithubException as e:
         if e.status == 422:
             return []
-        print(f"  Commit search error on page {page}: {e}")
+        print(f"  Commit search error: {e}")
         return []
     except Exception as e:
-        print(f"  Commit search error on page {page}: {e}")
+        print(f"  Commit search error: {e}")
         return []
 
 def get_code_batch(g, page):
@@ -218,10 +270,10 @@ def get_code_batch(g, page):
     except GithubException as e:
         if e.status == 422:
             return []
-        print(f"  Code search error on page {page}: {e}")
+        print(f"  Code search error: {e}")
         return []
     except Exception as e:
-        print(f"  Code search error on page {page}: {e}")
+        print(f"  Code search error: {e}")
         return []
 
 def get_issue_batch(g, page):
@@ -232,22 +284,23 @@ def get_issue_batch(g, page):
     except GithubException as e:
         if e.status == 422:
             return []
-        print(f"  Issue search error on page {page}: {e}")
+        print(f"  Issue search error: {e}")
         return []
     except Exception as e:
-        print(f"  Issue search error on page {page}: {e}")
+        print(f"  Issue search error: {e}")
         return []
 
 def scan_commit_batch(g, repo, state, processed, page):
-    print(f"\n  Fetching commits page {page}...")
+    print(f"\n  📦 Fetching commits page {page}...")
     commit_results = get_commit_batch(g, page)
     total = len(commit_results)
     
     if total == 0:
-        print(f"  No more commits at page {page}")
+        print(f"  No more commits")
         return 0, page + 1, False
     
     print(f"  Found {total} commits on page {page}")
+    replied_this_batch = 0
     
     for idx, commit in enumerate(commit_results):
         heartbeat()
@@ -262,7 +315,6 @@ def scan_commit_batch(g, repo, state, processed, page):
         author = commit.author.login if commit.author else "unknown"
         print(f"    [{idx+1}/{total}] Checking commit {sha[:8]} by {author}")
         
-        # Get commit diff
         full_text = title + "\n" + msg
         diff = ""
         try:
@@ -280,7 +332,7 @@ def scan_commit_batch(g, repo, state, processed, page):
                 uid = f"commit_{sha}_{key[:16]}"
                 if uid in processed:
                     continue
-                print(f"      Found {service} key: {key[:20]}...")
+                print(f"      🔑 Found {service} key: {key[:20]}...")
                 
                 line_num = None
                 line_content = ""
@@ -315,28 +367,38 @@ def scan_commit_batch(g, repo, state, processed, page):
                         mark_commit_replied(sha, state)
                         save_state(state)
                         scan_results["replied_count"] += 1
-                        scan_results["found_keys"].append({"type":"commit","sha":sha,"service":service,"key":key,"balance":bal,"info":info})
-                        print(f"        Replied to commit {sha[:8]}")
+                        scan_results["found_keys"].append({
+                            "type": "commit",
+                            "sha": sha,
+                            "service": service,
+                            "key": key,
+                            "balance": bal,
+                            "info": info,
+                            "url": commit.html_url
+                        })
+                        replied_this_batch += 1
+                        print(f"        ✅ Replied to commit {sha[:8]} - {info}")
                         time.sleep(1)
                     except Exception as e:
                         scan_results["errors"].append(str(e))
-                        print(f"        Failed: {e}")
+                        print(f"        ❌ Failed: {e}")
                 else:
-                    print(f"        Invalid: {info}")
+                    print(f"        ❌ Invalid: {info}")
         time.sleep(0.3)
     
-    return total, page + 1, True
+    return replied_this_batch, page + 1, True
 
 def scan_code_batch(g, repo, state, processed, page):
-    print(f"\n  Fetching code page {page}...")
+    print(f"\n  📦 Fetching code page {page}...")
     code_results = get_code_batch(g, page)
     total = len(code_results)
     
     if total == 0:
-        print(f"  No more code results at page {page}")
+        print(f"  No more code results")
         return 0, page + 1, False
     
     print(f"  Found {total} code files on page {page}")
+    replied_this_batch = 0
     
     for idx, code in enumerate(code_results):
         heartbeat()
@@ -359,6 +421,9 @@ def scan_code_batch(g, repo, state, processed, page):
             resp = requests.get(raw_url, timeout=10)
             if resp.status_code == 200:
                 content = resp.text
+            else:
+                print(f"      HTTP {resp.status_code}, skipping")
+                continue
         except Exception as e:
             print(f"      Error fetching file: {e}")
             continue
@@ -369,7 +434,7 @@ def scan_code_batch(g, repo, state, processed, page):
                 uid = f"code_{file_id}_{key[:16]}"
                 if uid in processed:
                     continue
-                print(f"      Found {service} key: {key[:20]}...")
+                print(f"      🔑 Found {service} key: {key[:20]}...")
                 
                 line_num = None
                 line_content = ""
@@ -386,33 +451,44 @@ def scan_code_batch(g, repo, state, processed, page):
                     reply = build_code_reply(author, service, key, info, file_url, file_path, line_num, line_content, bal)
                     try:
                         code_repo = g.get_repo(repo_name)
-                        issue_title = f"API Key Leak Detected in {file_path}"
+                        issue_title = f"🚨 API Key Leak Detected in {file_path}"
                         new_issue = code_repo.create_issue(title=issue_title, body=reply, labels=["security"])
                         mark_code_replied(file_id, state)
                         save_state(state)
                         scan_results["replied_count"] += 1
-                        scan_results["found_keys"].append({"type":"code","repo":repo_name,"file":file_path,"service":service,"key":key,"balance":bal,"info":info})
-                        print(f"        Created issue #{new_issue.number} for {repo_name}")
+                        scan_results["found_keys"].append({
+                            "type": "code",
+                            "repo": repo_name,
+                            "file": file_path,
+                            "service": service,
+                            "key": key,
+                            "balance": bal,
+                            "info": info,
+                            "url": file_url
+                        })
+                        replied_this_batch += 1
+                        print(f"        ✅ Created issue #{new_issue.number} in {repo_name} - {info}")
                         time.sleep(1)
                     except Exception as e:
                         scan_results["errors"].append(str(e))
-                        print(f"        Failed: {e}")
+                        print(f"        ❌ Failed: {e}")
                 else:
-                    print(f"        Invalid: {info}")
+                    print(f"        ❌ Invalid: {info}")
         time.sleep(0.3)
     
-    return total, page + 1, True
+    return replied_this_batch, page + 1, True
 
 def scan_issue_batch(g, repo, state, processed, page):
-    print(f"\n  Fetching issues page {page}...")
+    print(f"\n  📦 Fetching issues page {page}...")
     issue_results = get_issue_batch(g, page)
     total = len(issue_results)
     
     if total == 0:
-        print(f"  No more issues at page {page}")
+        print(f"  No more issues")
         return 0, page + 1, False
     
     print(f"  Found {total} issues on page {page}")
+    replied_this_batch = 0
     
     for idx, issue in enumerate(issue_results):
         heartbeat()
@@ -427,7 +503,6 @@ def scan_issue_batch(g, repo, state, processed, page):
         author = issue.user.login
         print(f"    [{idx+1}/{total}] Checking issue #{num} by {author}")
         
-        # Get comments (including the issue body itself)
         full_text = f"{title}\n{body}"
         try:
             for c in issue.get_comments():
@@ -441,7 +516,7 @@ def scan_issue_batch(g, repo, state, processed, page):
                 uid = f"i_{num}_{key[:16]}"
                 if uid in processed:
                     continue
-                print(f"      Found {service} key: {key[:20]}...")
+                print(f"      🔑 Found {service} key: {key[:20]}...")
                 
                 line_num = None
                 line_content = ""
@@ -460,7 +535,6 @@ def scan_issue_batch(g, repo, state, processed, page):
                             break
                     loc = "issue body"
                 else:
-                    # Found in comments
                     loc = "issue comment"
                     line_content = key[:200]
                 
@@ -473,72 +547,88 @@ def scan_issue_batch(g, repo, state, processed, page):
                         mark_issue_replied(num, state)
                         save_state(state)
                         scan_results["replied_count"] += 1
-                        scan_results["found_keys"].append({"type":"issue","number":num,"service":service,"key":key,"balance":bal,"info":info})
-                        print(f"        Replied to issue #{num}")
+                        scan_results["found_keys"].append({
+                            "type": "issue",
+                            "number": num,
+                            "service": service,
+                            "key": key,
+                            "balance": bal,
+                            "info": info,
+                            "url": issue.html_url
+                        })
+                        replied_this_batch += 1
+                        print(f"        ✅ Replied to issue #{num} - {info}")
                         time.sleep(1)
                     except Exception as e:
                         scan_results["errors"].append(str(e))
-                        print(f"        Failed: {e}")
+                        print(f"        ❌ Failed: {e}")
                 else:
-                    print(f"        Invalid: {info}")
+                    print(f"        ❌ Invalid: {info}")
         time.sleep(0.3)
     
-    return total, page + 1, True
+    return replied_this_batch, page + 1, True
 
 def check_and_reply():
     global last_heartbeat
     
-    print(f"Starting scan on {REPO_NAME}")
-    print(f"Max runtime: {MAX_RUNTIME_SECONDS}s (1.5 hours)")
-    print(f"Delay between batches: {BATCH_DELAY}s")
+    print(f"\n{'='*60}")
+    print(f"🤖 LLMApiCheckBot - API Key Leak Scanner")
+    print(f"📁 Repository: {REPO_NAME}")
+    print(f"⏱️  Max runtime: {MAX_RUNTIME_SECONDS}s (1.5 hours)")
+    print(f"⏸️  Delay between batches: {BATCH_DELAY}s")
+    print(f"{'='*60}\n")
     
     state = load_state()
-    print(f"Loaded state: {len(state.get('replied_commits', []))} commits, {len(state.get('replied_codes', []))} code files, {len(state.get('replied_issues', []))} issues")
+    print(f"📊 Loaded state: {len(state.get('replied_commits', []))} commits, {len(state.get('replied_codes', []))} code files, {len(state.get('replied_issues', []))} issues")
     
     commit_page = state.get("last_commit_page", 0)
     code_page = state.get("last_code_page", 0)
     issue_page = state.get("last_issue_page", 0)
-    print(f"Starting from commit page {commit_page}, code page {code_page}, issue page {issue_page}")
+    print(f"📍 Starting from commit page {commit_page}, code page {code_page}, issue page {issue_page}\n")
     
     auth = Auth.Token(PAT_TOKEN)
     g = Github(auth=auth)
     
     try:
         user = g.get_user()
-        print(f"Authenticated as: {user.login}")
+        print(f"✅ Authenticated as: {user.login}\n")
     except Exception as e:
-        print(f"Auth error: {e}")
+        print(f"❌ Auth error: {e}")
         return
     
     try:
         repo = g.get_repo(REPO_NAME)
-        print(f"Repository: {repo.full_name}")
+        print(f"✅ Repository: {repo.full_name}\n")
     except Exception as e:
-        print(f"Error accessing repo: {e}")
+        print(f"❌ Error accessing repo: {e}")
         return
     
     processed = set()
     batch_count = 0
+    total_replied = 0
     
     while True:
         check_timeout()
         batch_count += 1
         
         print(f"\n{'='*50}")
-        print(f"Batch #{batch_count}")
-        print(f"Commit page {commit_page}, Code page {code_page}, Issue page {issue_page}")
+        print(f"📦 Batch #{batch_count}")
+        print(f"📍 Commit page {commit_page}, Code page {code_page}, Issue page {issue_page}")
         print(f"{'='*50}")
         
         # Scan commits
-        commit_processed, commit_page, commit_has_more = scan_commit_batch(g, repo, state, processed, commit_page)
+        commit_replied, commit_page, commit_has_more = scan_commit_batch(g, repo, state, processed, commit_page)
+        total_replied += commit_replied
         check_timeout()
         
         # Scan code
-        code_processed, code_page, code_has_more = scan_code_batch(g, repo, state, processed, code_page)
+        code_replied, code_page, code_has_more = scan_code_batch(g, repo, state, processed, code_page)
+        total_replied += code_replied
         check_timeout()
         
         # Scan issues
-        issue_processed, issue_page, issue_has_more = scan_issue_batch(g, repo, state, processed, issue_page)
+        issue_replied, issue_page, issue_has_more = scan_issue_batch(g, repo, state, processed, issue_page)
+        total_replied += issue_replied
         
         # Save progress
         state["last_commit_page"] = commit_page
@@ -546,19 +636,40 @@ def check_and_reply():
         state["last_issue_page"] = issue_page
         save_state(state)
         
+        print(f"\n📊 Batch #{batch_count} summary:")
+        print(f"   ✅ Replied to {commit_replied} commits")
+        print(f"   ✅ Replied to {code_replied} code files")
+        print(f"   ✅ Replied to {issue_replied} issues")
+        print(f"   📈 Total replied so far: {total_replied}")
+        print(f"   📊 Total keys found: {len(scan_results['found_keys'])}")
+        
         # Check if all have no more results
         if not commit_has_more and not code_has_more and not issue_has_more:
-            print(f"\n[!] No more results from all searches. Exiting.")
+            print(f"\n✅ No more results from all searches. Scan complete.")
             break
         
-        print(f"\n[💤] Batch #{batch_count} completed. Waiting {BATCH_DELAY}s...")
+        print(f"\n💤 Waiting {BATCH_DELAY} seconds before next batch...")
         for i in range(BATCH_DELAY):
             check_timeout()
+            if i % 5 == 0 and i > 0:
+                print(f"   ... {BATCH_DELAY - i} seconds remaining")
             time.sleep(1)
     
     elapsed = time.time() - start_time
-    print(f"\nScan completed in {elapsed:.0f}s")
-    print(f"Found {len(scan_results['found_keys'])} new valid keys, replied to {scan_results['replied_count']} items.")
+    print(f"\n{'='*60}")
+    print(f"✅ Scan completed in {elapsed:.0f}s")
+    print(f"📊 Found {len(scan_results['found_keys'])} valid keys")
+    print(f"📊 Replied to {scan_results['replied_count']} items")
+    
+    # Print all found keys
+    if scan_results['found_keys']:
+        print(f"\n🔑 Valid keys found:")
+        for i, key_info in enumerate(scan_results['found_keys'], 1):
+            print(f"   {i}. [{key_info['service']}] {key_info['key']}")
+            print(f"      {key_info['info']}")
+            print(f"      {key_info['url']}")
+    
+    print(f"{'='*60}")
     save_result()
     save_state(state)
 
@@ -566,7 +677,7 @@ if __name__ == "__main__":
     try:
         check_and_reply()
     except Exception as e:
-        print(f"Fatal error: {e}")
+        print(f"❌ Fatal error: {e}")
         save_state()
         save_result()
         sys.exit(1)
