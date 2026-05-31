@@ -5,6 +5,7 @@ API Key Leak Scanner - Dual Notification Version
 - For PRs and Commits: Only notify fallback repo (no original notification)
 - OpenRouter support with credits display
 - 29.5 minute timeout, infinite pagination
+- Fallback notification includes bot installation link
 """
 
 import os
@@ -258,10 +259,20 @@ def save_final_results():
                     f.write(f"{service} | {key} | {info} | {source_url}\n")
             print(f"\n💾 Saved {len(found_valid_keys)} keys to valid_keys_final_{timestamp}.txt")
 
-# ========== 回复模板 ==========
-def build_reply(author, service, key, info, source_url, source_type, balance=None):
+# ========== 回复模板（带 fallback 安装链接） ==========
+def build_reply(author, service, key, info, source_url, source_type, balance=None, is_fallback=False):
     masked = key[:12] + "..." + key[-8:] if len(key) > 24 else key
     balance_text = f" (Balance: {balance})" if balance is not None and balance > 0 else ""
+    
+    install_note = ""
+    if is_fallback:
+        install_note = f"""
+
+---
+📌 **To receive notifications directly in your repository, install this bot:**
+https://github.com/apps/llmapicheckbot2
+"""
+    
     return f"""🔴 **API Key Leak Detected!**
 
 @{author} Your API key has been exposed in this {source_type}{balance_text}.
@@ -279,7 +290,7 @@ def build_reply(author, service, key, info, source_url, source_type, balance=Non
 📍 **Source:** {source_url}
 
 ---
-{BOT_SIGNATURE}"""
+{BOT_SIGNATURE}{install_note}"""
 
 # ========== 在原仓库回复 Issue ==========
 def reply_to_original_issue(g, source_url, author, service, key, info, balance):
@@ -300,7 +311,7 @@ def reply_to_original_issue(g, source_url, author, service, key, info, balance):
                 print(f"    ⏭️ Already replied to issue #{issue_num} in {repo_path}")
                 return True
 
-        message = build_reply(author, service, key, info, source_url, "issue", balance)
+        message = build_reply(author, service, key, info, source_url, "issue", balance, is_fallback=False)
         issue.create_comment(message)
         print(f"    📝 Replied to issue #{issue_num} in {repo_path}")
         return True
@@ -327,7 +338,7 @@ def create_issue_in_original_repo(g, source_url, author, service, key, info, bal
                 print(f"    ⏭️ Issue already exists for {file_path} in {repo_path}")
                 return True
 
-        message = build_reply(author, service, key, info, source_url, "code file", balance)
+        message = build_reply(author, service, key, info, source_url, "code file", balance, is_fallback=False)
         issue_title = f"🔴 API Key Leak Detected in {file_path}"
         issue_body = message + f"\n\n**File:** `{file_path}`"
         repo.create_issue(title=issue_title, body=issue_body, labels=["security"])
@@ -340,7 +351,7 @@ def create_issue_in_original_repo(g, source_url, author, service, key, info, bal
 # ========== 在本仓库创建 Issue (fallback + PR/commit) ==========
 def create_issue_in_my_repo(g, key, service, info, source_url, source_type, author, balance, is_fallback=False):
     """在自己的仓库创建 Issue 记录"""
-    message = build_reply(author, service, key, info, source_url, source_type, balance)
+    message = build_reply(author, service, key, info, source_url, source_type, balance, is_fallback=is_fallback)
 
     try:
         my_repo = g.get_repo(REPO_NAME)
