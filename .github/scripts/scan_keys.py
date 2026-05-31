@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-API Key Leak Scanner - Full Version with Source Tracking
-Supports: Code + Issues + Commits
+API Key Leak Scanner - Full Version with Smart Reply
+- Issue leaks: reply directly in the issue
+- Code/Commit leaks: create issue in Dont-Be-Stupid-Leaker repository
 """
 
 import os
@@ -59,6 +60,10 @@ pending_batches: Dict[int, List[Tuple]] = defaultdict(list)
 batch_locks: Dict[int, Lock] = {}
 pending_count: Dict[int, int] = defaultdict(int)
 
+# 已回复的记录
+replied_issues: set = set()
+replied_lock = Lock()
+
 # ========== Key 正则 ==========
 KEY_PATTERNS = {
     "OpenAI": re.compile(r"sk-proj-[a-zA-Z0-9]{32,}"),
@@ -102,12 +107,6 @@ def _parse_openrouter(code, data):
     return False, 0, f"HTTP {code}"
 
 def _parse_gemini(code, data):
-    """
-    Gemini API 验证
-    200: 完全有效
-    403: Key 有效但受限制（IP/地域/billing），仍视为有效
-    400: 可能是格式问题，也可能是 key 无效
-    """
     if code == 200:
         return True, 0, "✅ Valid"
     if code == 403:
@@ -214,6 +213,7 @@ def check_timeout():
     elapsed = time.time() - start_time
     if elapsed >= MAX_RUNTIME_SECONDS:
         print(f"\n[!] Max runtime reached. Exiting.")
+        save_final_results()
         sys.exit(0)
     return elapsed
 
@@ -229,18 +229,114 @@ def signal_handler(sig, frame):
     print("\n\n⚠️ Interrupted, saving results...")
     stop_event.set()
     time.sleep(2)
+    save_final_results()
     sys.exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
+def save_final_results():
+    with valid_lock:
+        if found_valid_keys:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            with open(f"valid_keys_final_{timestamp}.txt", "w") as f:
+                f.write(f"# Scan time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"# Total valid keys: {len(found_valid_keys)}\n\n")
+                for key, service, balance, info, source_url, source_type, _ in found_valid_keys:
+                    f.write(f"{service} | {key} | {info} | {source_url}\n")
+            print(f"\n💾 Saved {len(found_valid_keys)} keys to valid_keys_final_{timestamp}.txt")
+
 # ========== 回复模板 ==========
 def build_reply(author, service, key, info, source_url, source_type):
     masked = key[:12] + "..." + key[-8:] if len(key) > 24 else key
-    return f"@{author} Your API key has been exposed!\n\n# Summary\nThis is a **{service}** API key found in {source_type}: [{source_url}]({source_url}).\n\nKey preview: `{masked}`\n\nVerification result: {info}\n\n---\n\n**What to do:**\n1. Revoke this key from {service} dashboard\n2. Generate a new key\n3. Remove the exposed key\n4. Rotate other exposed secrets\n\n---\n{BOT_SIGNATURE}"
+    return f"""🔴 **API Key Leak Detected!**
+
+@{author} Your API key has been exposed in this {source_type}.
+
+**Service:** `{service}`
+**Key preview:** `{masked}`
+**Status:** {info}
+
+⚠️ **Immediate Actions Required:**
+1. Revoke this key immediately from your {service} dashboard
+2. Generate a new key
+3. Remove the exposed key from the {source_type}
+4. Rotate any other secrets that may be compromised
+
+📍 **Source:** {source_url}
+
+---
+{BOT_SIGNATURE}"""
+
+# ========== 智能回复函数 ==========
+def smart_reply(g, key, service, info, source_url, source_type, author):
+    """
+    智能回复：
+    - Issue 来源：直接回复原 Issue
+    - Code/Commit 来源：在自己的仓库创建 Issue
+    """
+    message = build_reply(author, service, key, info, source_url, source_type)
+    
+    with replied_lock:
+        if source_url in replied_issues:
+            return
+        replied_issues.add(source_url)
+    
+    if "issue" in source_type:
+        # 直接回复原 Issue
+        try:
+            parts = source_url.replace("https://github.com/", "").split("/issues/")
+            if len(parts) != 2:
+                print(f"    ❌ Failed to parse issue URL: {source_url}")
+                return
+            repo_path = parts[0]
+            issue_num = int(parts[1])
+            
+            repo = g.get_repo(repo_path)
+            issue = repo.get_issue(number=issue_num)
+            issue.create_comment(message)
+            print(f"    📝 Replied to issue #{issue_num} in {repo_path}")
+        except Exception as e:
+            print(f"    ❌ Failed to reply to issue: {e}")
+    else:
+        # Code/Commit 来源，在自己的仓库创建 Issue
+        try:
+            my_repo = g.get_repo(REPO_NAME)
+            
+            # 生成简洁的标题
+            short_url = source_url.replace("https://github.com/", "")
+            if len(short_url) > 60:
+                short_url = short_url[:57] + "..."
+            
+            issue_title = f"🔴 {service} Key Leak in {source_type}: {short_url}"
+            issue_body = f"""## API Key Leak Detected
+
+| Field | Value |
+|-------|-------|
+| **Source Type** | {source_type} |
+| **Source URL** | {source_url} |
+| **Service** | `{service}` |
+| **Key Preview** | `{key[:20]}...` |
+| **Status** | {info} |
+| **Author** | @{author} |
+
+---
+
+### Original Message
+
+{message}
+
+---
+
+*Auto-generated by {BOT_NAME}*
+"""
+            new_issue = my_repo.create_issue(title=issue_title, body=issue_body, labels=["security", "leak"])
+            print(f"    📝 Created issue #{new_issue.number} in {REPO_NAME}")
+        except Exception as e:
+            print(f"    ❌ Failed to create issue: {e}")
 
 # ========== 验证批次 ==========
-def verify_batch(worker_id, batch):
+def verify_batch(worker_id, batch, g):
     if not batch:
         return
     safe_print(f"\n[Worker-{worker_id}] 🔍 Verifying {len(batch)} keys...")
@@ -274,17 +370,23 @@ def verify_batch(worker_id, batch):
                 if valid:
                     print(f"  ✅ [{service}] {key[:25]}... -> {info}")
                     print(f"     📍 Source: {source_url}")
+                    
+                    # 保存
                     with valid_lock:
                         found_valid_keys.append((key, service, balance, info, source_url, source_type, datetime.now()))
                     with open("valid_keys_realtime.txt", "a") as f:
                         f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | {service} | {key} | {info} | {source_url}\n")
+                    
+                    # 智能回复
+                    smart_reply(g, key, service, info, source_url, source_type, author)
+                    
                 else:
                     print(f"  ❌ [{service}] {key[:25]}... -> {info}")
                     print(f"     📍 Source: {source_url}")
             except Exception as e:
                 print(f"  ❌ Exception: {e}")
 
-def add_key_to_pending(worker_id, key, service, source_url, source_type, author):
+def add_key_to_pending(worker_id, key, service, source_url, source_type, author, g):
     if worker_id not in batch_locks:
         batch_locks[worker_id] = Lock()
     with batch_locks[worker_id]:
@@ -295,22 +397,21 @@ def add_key_to_pending(worker_id, key, service, source_url, source_type, author)
             pending_batches[worker_id].clear()
             pending_count[worker_id] = 0
             executor = ThreadPoolExecutor(max_workers=1)
-            executor.submit(verify_batch, worker_id, batch)
+            executor.submit(verify_batch, worker_id, batch, g)
             executor.shutdown(wait=False)
 
-def extract_and_queue(text, source_url, source_type, worker_id, author):
+def extract_and_queue(text, source_url, source_type, worker_id, author, g):
     for service, pattern in KEY_PATTERNS.items():
         for match in pattern.finditer(text):
             key = match.group(0)
             with valid_lock:
                 if any(key == k for k, _, _, _, _, _, _ in found_valid_keys):
                     continue
-            # 打印发现的 Key 及其出处
             print(f"  🔑 Found {service} key in {source_type}: {source_url[:80]}...")
-            add_key_to_pending(worker_id, key, service, source_url, source_type, author)
+            add_key_to_pending(worker_id, key, service, source_url, source_type, author, g)
 
 # ========== Code 搜索 ==========
-def search_code_worker(worker_id, start_page):
+def search_code_worker(worker_id, start_page, g):
     safe_print(f"\n[Worker-{worker_id}] 🚀 Starting CODE scan from page {start_page}")
     page = start_page
     items_processed = 0
@@ -339,7 +440,7 @@ def search_code_worker(worker_id, start_page):
                 try:
                     resp = requests.get(raw_url, timeout=10)
                     if resp.status_code == 200:
-                        extract_and_queue(resp.text, item.get("html_url", ""), "code", worker_id, author)
+                        extract_and_queue(resp.text, item.get("html_url", ""), "code", worker_id, author, g)
                 except:
                     pass
                 items_processed += 1
@@ -352,7 +453,7 @@ def search_code_worker(worker_id, start_page):
     safe_print(f"[Worker-{worker_id}] CODE scan finished, processed {items_processed} files")
 
 # ========== Issues 搜索 ==========
-def search_issues_worker(worker_id, start_page):
+def search_issues_worker(worker_id, start_page, g):
     safe_print(f"\n[Worker-{worker_id}] 🚀 Starting ISSUE scan from page {start_page}")
     query = ISSUE_QUERY
     page = start_page
@@ -381,7 +482,17 @@ def search_issues_worker(worker_id, start_page):
                 body = item.get("body", "") or ""
                 author = item.get("user", {}).get("login", "unknown")
                 full_text = title + "\n" + body
-                extract_and_queue(full_text, item.get("html_url", ""), "issue", worker_id, author)
+                # 也获取评论内容
+                try:
+                    comments_url = item.get("comments_url", "")
+                    if comments_url:
+                        ccode, cdata = _http_request(comments_url, headers=_gh_headers(), timeout=10)
+                        if ccode == 200 and isinstance(cdata, list):
+                            for comment in cdata:
+                                full_text += f"\n{comment.get('body', '')}"
+                except:
+                    pass
+                extract_and_queue(full_text, item.get("html_url", ""), "issue", worker_id, author, g)
                 items_processed += 1
             page += 1
             time.sleep(0.5)
@@ -392,7 +503,7 @@ def search_issues_worker(worker_id, start_page):
     safe_print(f"[Worker-{worker_id}] ISSUE scan finished, processed {items_processed} items")
 
 # ========== Commits 搜索 ==========
-def search_commits_worker(worker_id, start_page):
+def search_commits_worker(worker_id, start_page, g):
     safe_print(f"\n[Worker-{worker_id}] 🚀 Starting COMMIT scan from page {start_page}")
     page = start_page
     items_processed = 0
@@ -418,7 +529,20 @@ def search_commits_worker(worker_id, start_page):
                     break
                 message = item.get("commit", {}).get("message", "")
                 author = item.get("author", {}).get("login", "unknown") if item.get("author") else "unknown"
-                extract_and_queue(message, item.get("html_url", ""), "commit", worker_id, author)
+                # 尝试获取 diff 内容
+                full_text = message
+                try:
+                    diff_url = item.get("html_url", "").replace("github.com", "api.github.com/repos")
+                    diff_url = diff_url.replace("/commit/", "/commits/")
+                    dcode, ddata = _http_request(diff_url, headers=_gh_headers(), timeout=10)
+                    if dcode == 200 and isinstance(ddata, dict):
+                        for f in ddata.get("files", []):
+                            patch = f.get("patch", "")
+                            if patch:
+                                full_text += "\n" + patch
+                except:
+                    pass
+                extract_and_queue(full_text, item.get("html_url", ""), "commit", worker_id, author, g)
                 items_processed += 1
             page += 1
             time.sleep(0.5)
@@ -431,9 +555,12 @@ def search_commits_worker(worker_id, start_page):
 # ========== 主函数 ==========
 def main():
     print("=" * 70)
-    print("🤖 API Key Leak Scanner - Full Version with Source Tracking")
+    print("🤖 API Key Leak Scanner - Smart Reply Version")
     print("📊 Scanning: CODE + ISSUES + COMMITS")
     print("📊 Supports: OpenAI(sk-proj-), OpenRouter, DeepSeek, Gemini, Anthropic, Replicate, HuggingFace, MiMo")
+    print("📊 Reply Strategy:")
+    print("   - Issue leak: Reply directly in the original issue")
+    print(f"   - Code/Commit leak: Create issue in {REPO_NAME}")
     print("=" * 70)
     
     g = get_github_client()
@@ -441,12 +568,14 @@ def main():
         print("❌ Failed to initialize GitHub client")
         return
     
+    print("✅ GitHub client initialized\n")
+    
     with ThreadPoolExecutor(max_workers=SEARCH_WORKERS) as executor:
         futures = [
-            executor.submit(search_code_worker, 1, 1),
-            executor.submit(search_issues_worker, 2, 1),
-            executor.submit(search_commits_worker, 3, 1),
-            executor.submit(search_issues_worker, 4, 6),
+            executor.submit(search_code_worker, 1, 1, g),
+            executor.submit(search_issues_worker, 2, 1, g),
+            executor.submit(search_commits_worker, 3, 1, g),
+            executor.submit(search_issues_worker, 4, 6, g),
         ]
         for future in as_completed(futures):
             try:
@@ -461,4 +590,5 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         print(f"❌ Fatal error: {e}")
+        save_final_results()
         sys.exit(1)
