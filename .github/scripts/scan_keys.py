@@ -16,9 +16,9 @@ from github import Github, Auth, GithubException
 # ========== Configuration ==========
 MAX_RUNTIME_SECONDS = 90 * 60
 HEARTBEAT_INTERVAL = 300
-BATCH_DELAY = 5
-BATCH_SIZE = 20  # 每批取20条
-MAX_WORKERS = 5
+BATCH_DELAY = 3
+BATCH_SIZE = 15  # 每批取15条
+MAX_WORKERS = 10
 
 # GitHub App 配置
 APP_ID = os.environ.get("APP_ID")
@@ -50,7 +50,7 @@ start_time = time.time()
 last_heartbeat = start_time
 stop_scan = False
 
-# 拆分搜索条件 (每个查询最多5个OR)
+# 拆分搜索条件
 ISSUE_QUERIES = [
     '"your key leak"',
     '"sk-" OR "sk-proj-" OR "AIza"',
@@ -130,13 +130,9 @@ def load_state():
                 state["replied_issues"] = []
             if "replied_commits" not in state:
                 state["replied_commits"] = []
-            if "issue_offset" not in state:
-                state["issue_offset"] = 0
-            if "commit_offset" not in state:
-                state["commit_offset"] = 0
             return state
     except:
-        return {"replied_issues": [], "replied_commits": [], "issue_offset": 0, "commit_offset": 0}
+        return {"replied_issues": [], "replied_commits": []}
 
 def save_state(state=None):
     if state is None:
@@ -269,14 +265,15 @@ def save_result():
         json.dump(scan_results, f, indent=2)
     print(f"💾 Saved to {fname}")
 
-def fetch_issues_with_pagination(g, query, limit=100):
-    """带分页和403重置的issue获取"""
+def fetch_items_with_retry(search_func, query, limit=30):
+    """通用获取函数，遇到403重置"""
     all_items = []
     page = 1
     
     while len(all_items) < limit and not stop_scan:
         try:
-            items = list(g.search_issues(query, sort="created", order="desc").get_page(page))
+            results = search_func(query, sort="created", order="desc")
+            items = list(results.get_page(page))
             if not items:
                 break
             all_items.extend(items)
@@ -284,35 +281,7 @@ def fetch_issues_with_pagination(g, query, limit=100):
             time.sleep(0.3)
         except GithubException as e:
             if e.status == 403:
-                print(f"    ⚠️ 403 on page {page}, resetting to page 1")
-                page = 1
-                time.sleep(60)  # 等待60秒后继续
-                continue
-            else:
-                print(f"    Error: {e}")
-                break
-        except Exception as e:
-            print(f"    Error: {e}")
-            break
-    
-    return all_items[:limit]
-
-def fetch_commits_with_pagination(g, query, limit=100):
-    """带分页和403重置的commit获取"""
-    all_items = []
-    page = 1
-    
-    while len(all_items) < limit and not stop_scan:
-        try:
-            items = list(g.search_commits(query, sort="committer-date", order="desc").get_page(page))
-            if not items:
-                break
-            all_items.extend(items)
-            page += 1
-            time.sleep(0.3)
-        except GithubException as e:
-            if e.status == 403:
-                print(f"    ⚠️ 403 on page {page}, resetting to page 1")
+                print(f"    ⚠️ 403, resetting to page 1")
                 page = 1
                 time.sleep(60)
                 continue
@@ -325,8 +294,135 @@ def fetch_commits_with_pagination(g, query, limit=100):
     
     return all_items[:limit]
 
-def scan_issues_batch(g, state, processed):
-    """扫描 Issues (自动处理403，无限滚动)"""
+def process_issue(g, issue, state, processed):
+    """处理单个 issue"""
+    num = issue.number
+    if has_replied_to_issue(num, state):
+        return 0
+    
+    title = issue.title
+    body = issue.body or ""
+    full_text = f"{title}\n{body}"
+    
+    try:
+        for c in issue.get_comments():
+            full_text += f"\n{c.body or ''}"
+    except:
+        pass
+    
+    for service, pattern in KEY_PATTERNS.items():
+        for m in pattern.finditer(full_text):
+            key = m.group(0)
+            uid = f"i_{num}_{key[:16]}"
+            if uid in processed:
+                continue
+            
+            line_num = None
+            line_content = ""
+            loc = "issue"
+            if key in title:
+                line_num = 1
+                line_content = title[:200]
+            elif key in body:
+                lines = body.split('\n')
+                for i, l in enumerate(lines):
+                    if key in l:
+                        line_num = i + 1
+                        line_content = l.strip()[:200]
+                        break
+            else:
+                loc = "issue comment"
+                line_content = key[:200]
+            
+            valid, bal, info = verify_key(service, key)
+            if valid:
+                processed.add(uid)
+                reply = build_reply(issue.user.login, service, key, info, issue.html_url, "issue", loc, line_num, line_content, bal)
+                try:
+                    issue.create_comment(reply)
+                    mark_replied_issue(num, state)
+                    save_state(state)
+                    scan_results["replied_count"] += 1
+                    scan_results["found_keys"].append({"type":"issue","number":num,"service":service,"key":key,"balance":bal,"info":info})
+                    print(f"      ✅ Replied to issue #{num} - {service} key")
+                    time.sleep(1)
+                    return 1
+                except Exception as e:
+                    scan_results["errors"].append(str(e))
+    return 0
+
+def process_commit(g, commit, state, processed):
+    """处理单个 commit"""
+    sha = commit.sha
+    if has_replied_to_commit(sha, state):
+        return 0
+    
+    msg = commit.commit.message
+    title = msg.split('\n')[0]
+    author = commit.author.login if commit.author else "unknown"
+    
+    full_text = title + "\n" + msg
+    diff = ""
+    try:
+        if commit.repository:
+            files = commit.repository.get_commit(sha).files
+            for f in files:
+                if f.patch:
+                    diff += f.patch + "\n"
+            full_text += "\n" + diff
+    except:
+        pass
+    
+    for service, pattern in KEY_PATTERNS.items():
+        for m in pattern.finditer(full_text):
+            key = m.group(0)
+            uid = f"c_{sha}_{key[:16]}"
+            if uid in processed:
+                continue
+            
+            line_num = None
+            line_content = ""
+            loc = "commit diff"
+            
+            if key in title:
+                line_num = 1
+                line_content = title[:200]
+                loc = "commit title"
+            elif key in msg:
+                lines = msg.split('\n')
+                for i, l in enumerate(lines):
+                    if key in l:
+                        line_num = i + 1
+                        line_content = l.strip()[:200]
+                        break
+                loc = "commit message"
+            elif key in diff:
+                lines = diff.split('\n')
+                for i, l in enumerate(lines):
+                    if key in l:
+                        line_num = i + 1
+                        line_content = l.strip()[:200]
+                        break
+            
+            valid, bal, info = verify_key(service, key)
+            if valid:
+                processed.add(uid)
+                reply = build_reply(author, service, key, info, commit.html_url, "commit", loc, line_num, line_content, bal)
+                try:
+                    commit.create_comment(reply)
+                    mark_replied_commit(sha, state)
+                    save_state(state)
+                    scan_results["replied_count"] += 1
+                    scan_results["found_keys"].append({"type":"commit","sha":sha,"service":service,"key":key,"balance":bal,"info":info})
+                    print(f"      ✅ Replied to commit {sha[:8]} - {service} key")
+                    time.sleep(1)
+                    return 1
+                except Exception as e:
+                    scan_results["errors"].append(str(e))
+    return 0
+
+def scan_issues_parallel(g, state, processed):
+    """并行扫描 Issues"""
     print(f"\n  📄 Fetching issues...")
     all_issues = []
     seen_urls = set()
@@ -334,8 +430,8 @@ def scan_issues_batch(g, state, processed):
     for query in ISSUE_QUERIES:
         if stop_scan:
             break
-        print(f"    Query: {query[:50]}...")
-        items = fetch_issues_with_pagination(g, query, limit=50)
+        print(f"    Query: {query[:40]}...")
+        items = fetch_items_with_retry(g.search_issues, query, limit=30)
         for item in items:
             if item.html_url not in seen_urls:
                 seen_urls.add(item.html_url)
@@ -347,73 +443,24 @@ def scan_issues_batch(g, state, processed):
         return 0
     
     print(f"    Found {len(all_issues)} unique issues")
-    replied = 0
     
-    for issue in all_issues[:BATCH_SIZE]:
-        if stop_scan:
-            break
-        heartbeat()
-        check_timeout()
-        
-        num = issue.number
-        if has_replied_to_issue(num, state):
-            continue
-        
-        title = issue.title
-        body = issue.body or ""
-        full_text = f"{title}\n{body}"
-        
-        try:
-            for c in issue.get_comments():
-                full_text += f"\n{c.body or ''}"
-        except:
-            pass
-        
-        for service, pattern in KEY_PATTERNS.items():
-            for m in pattern.finditer(full_text):
-                key = m.group(0)
-                uid = f"i_{num}_{key[:16]}"
-                if uid in processed:
-                    continue
-                
-                line_num = None
-                line_content = ""
-                loc = "issue"
-                if key in title:
-                    line_num = 1
-                    line_content = title[:200]
-                elif key in body:
-                    lines = body.split('\n')
-                    for i, l in enumerate(lines):
-                        if key in l:
-                            line_num = i + 1
-                            line_content = l.strip()[:200]
-                            break
-                else:
-                    loc = "issue comment"
-                    line_content = key[:200]
-                
-                valid, bal, info = verify_key(service, key)
-                if valid:
-                    processed.add(uid)
-                    reply = build_reply(issue.user.login, service, key, info, issue.html_url, "issue", loc, line_num, line_content, bal)
-                    try:
-                        issue.create_comment(reply)
-                        mark_replied_issue(num, state)
-                        save_state(state)
-                        scan_results["replied_count"] += 1
-                        scan_results["found_keys"].append({"type":"issue","number":num,"service":service,"key":key,"balance":bal,"info":info})
-                        replied += 1
-                        print(f"      ✅ Replied to issue #{num} - {service} key")
-                        time.sleep(1)
-                    except Exception as e:
-                        scan_results["errors"].append(str(e))
-        time.sleep(0.3)
+    # 并行处理 issues
+    replied = 0
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(process_issue, g, issue, state, processed): issue 
+                   for issue in all_issues[:BATCH_SIZE]}
+        for future in as_completed(futures):
+            if stop_scan:
+                break
+            try:
+                replied += future.result()
+            except Exception as e:
+                scan_results["errors"].append(str(e))
     
     return replied
 
-def scan_commits_batch(g, state, processed):
-    """扫描 Commits (自动处理403，无限滚动)"""
+def scan_commits_parallel(g, state, processed):
+    """并行扫描 Commits"""
     print(f"\n  📄 Fetching commits...")
     all_commits = []
     seen_urls = set()
@@ -421,8 +468,8 @@ def scan_commits_batch(g, state, processed):
     for query in COMMIT_QUERIES:
         if stop_scan:
             break
-        print(f"    Query: {query[:50]}...")
-        items = fetch_commits_with_pagination(g, query, limit=50)
+        print(f"    Query: {query[:40]}...")
+        items = fetch_items_with_retry(g.search_commits, query, limit=30)
         for item in items:
             if item.html_url not in seen_urls:
                 seen_urls.add(item.html_url)
@@ -434,81 +481,19 @@ def scan_commits_batch(g, state, processed):
         return 0
     
     print(f"    Found {len(all_commits)} unique commits")
-    replied = 0
     
-    for commit in all_commits[:BATCH_SIZE]:
-        if stop_scan:
-            break
-        heartbeat()
-        check_timeout()
-        
-        sha = commit.sha
-        if has_replied_to_commit(sha, state):
-            continue
-        
-        msg = commit.commit.message
-        title = msg.split('\n')[0]
-        author = commit.author.login if commit.author else "unknown"
-        
-        full_text = title + "\n" + msg
-        diff = ""
-        try:
-            if commit.repository:
-                files = commit.repository.get_commit(sha).files
-                for f in files:
-                    if f.patch:
-                        diff += f.patch + "\n"
-                full_text += "\n" + diff
-        except:
-            pass
-        
-        for service, pattern in KEY_PATTERNS.items():
-            for m in pattern.finditer(full_text):
-                key = m.group(0)
-                uid = f"c_{sha}_{key[:16]}"
-                if uid in processed:
-                    continue
-                
-                line_num = None
-                line_content = ""
-                loc = "commit diff"
-                
-                if key in title:
-                    line_num = 1
-                    line_content = title[:200]
-                    loc = "commit title"
-                elif key in msg:
-                    lines = msg.split('\n')
-                    for i, l in enumerate(lines):
-                        if key in l:
-                            line_num = i + 1
-                            line_content = l.strip()[:200]
-                            break
-                    loc = "commit message"
-                elif key in diff:
-                    lines = diff.split('\n')
-                    for i, l in enumerate(lines):
-                        if key in l:
-                            line_num = i + 1
-                            line_content = l.strip()[:200]
-                            break
-                
-                valid, bal, info = verify_key(service, key)
-                if valid:
-                    processed.add(uid)
-                    reply = build_reply(author, service, key, info, commit.html_url, "commit", loc, line_num, line_content, bal)
-                    try:
-                        commit.create_comment(reply)
-                        mark_replied_commit(sha, state)
-                        save_state(state)
-                        scan_results["replied_count"] += 1
-                        scan_results["found_keys"].append({"type":"commit","sha":sha,"service":service,"key":key,"balance":bal,"info":info})
-                        replied += 1
-                        print(f"      ✅ Replied to commit {sha[:8]} - {service} key")
-                        time.sleep(1)
-                    except Exception as e:
-                        scan_results["errors"].append(str(e))
-        time.sleep(0.3)
+    # 并行处理 commits
+    replied = 0
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(process_commit, g, commit, state, processed): commit 
+                   for commit in all_commits[:BATCH_SIZE]}
+        for future in as_completed(futures):
+            if stop_scan:
+                break
+            try:
+                replied += future.result()
+            except Exception as e:
+                scan_results["errors"].append(str(e))
     
     return replied
 
@@ -519,7 +504,7 @@ def check_and_reply():
     print(f"🤖 {BOT_NAME} - API Key Leak Scanner (GitHub App)")
     print(f"📁 Self repo: {REPO_NAME}")
     print(f"⏱️  Max runtime: {MAX_RUNTIME_SECONDS}s")
-    print(f"🔄 Mode: Infinite scroll (reset on 403)")
+    print(f"⚡ Parallel mode: Issues + Commits running simultaneously")
     print(f"{'='*60}\n")
     
     g = get_github_client()
@@ -541,17 +526,18 @@ def check_and_reply():
         batch_count += 1
         
         print(f"\n{'='*50}")
-        print(f"Batch #{batch_count}")
+        print(f"Batch #{batch_count} (Parallel)")
         print(f"{'='*50}")
         
-        # 扫描 Issues
-        issue_replied = scan_issues_batch(g, state, processed)
-        total_replied += issue_replied
-        check_timeout()
+        # 并行执行 Issues 和 Commits 扫描
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            issue_future = executor.submit(scan_issues_parallel, g, state, processed)
+            commit_future = executor.submit(scan_commits_parallel, g, state, processed)
+            
+            issue_replied = issue_future.result()
+            commit_replied = commit_future.result()
         
-        # 扫描 Commits
-        commit_replied = scan_commits_batch(g, state, processed)
-        total_replied += commit_replied
+        total_replied += issue_replied + commit_replied
         
         # 保存进度
         save_state(state)
