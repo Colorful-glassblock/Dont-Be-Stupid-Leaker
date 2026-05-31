@@ -25,9 +25,9 @@ from github import Github, Auth, GithubException
 # ========== Configuration ==========
 MAX_RUNTIME_SECONDS = 90 * 60  # 1.5 hours
 HEARTBEAT_INTERVAL = 300
-REQUEST_TIMEOUT = 10
+REQUEST_TIMEOUT = 15
 PER_PAGE = 30
-MAX_PAGES = 8
+MAX_PAGES = 50                # 增加到50页，不会过早停止
 SEARCH_WORKERS = 3
 VERIFY_WORKERS = 30
 BATCH_SIZE = 50
@@ -36,7 +36,7 @@ BATCH_SIZE = 50
 APP_ID = os.environ.get("APP_ID")
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY")
 INSTALLATION_ID = os.environ.get("INSTALLATION_ID")
-PAT_TOKEN = os.environ.get("PAT_TOKEN")  # 备用
+PAT_TOKEN = os.environ.get("PAT_TOKEN")
 
 REPO_NAME = os.environ.get("GITHUB_REPOSITORY", "Colorful-glassblock/Dont-Be-Stupid-Leaker")
 BOT_NAME = "LLMApiCheckBot"
@@ -163,7 +163,6 @@ VERIFIERS = {
 def get_github_client():
     token = None
     
-    # 尝试 GitHub App
     if APP_ID and PRIVATE_KEY and INSTALLATION_ID:
         try:
             payload = {"iat": int(time.time()), "exp": int(time.time()) + 600, "iss": APP_ID}
@@ -177,7 +176,6 @@ def get_github_client():
         except Exception as e:
             print(f"⚠️ GitHub App auth failed: {e}")
     
-    # 回退到 PAT
     if not token and PAT_TOKEN:
         token = PAT_TOKEN
         print("✅ Using PAT authentication")
@@ -191,7 +189,10 @@ def get_github_client():
 
 # ========== 工具函数 ==========
 def _gh_headers():
-    return {"Authorization": f"Bearer {PAT_TOKEN}", "Accept": "application/vnd.github+json", "User-Agent": "KeyScanner"}
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "KeyScanner"}
+    if PAT_TOKEN:
+        headers["Authorization"] = f"Bearer {PAT_TOKEN}"
+    return headers
 
 def _http_request(url, headers, method="GET", body=None, timeout=REQUEST_TIMEOUT):
     try:
@@ -252,7 +253,7 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-# ========== 回复模板 (英文警告 leaker) ==========
+# ========== 回复模板 ==========
 def build_reply(service, key, info, source_url, source_type):
     masked = key[:12] + "..." + key[-8:] if len(key) > 24 else key
     return f"""🔴 **API Key Leak Detected!**
@@ -312,24 +313,22 @@ def verify_batch(worker_id, batch):
                 result = future.result(timeout=15)
                 if result:
                     results.append(result)
+                    # 立即处理找到的 Key
+                    key, service, balance, info, source_url, source_type, ts = result
+                    with valid_lock:
+                        found_valid_keys.append(result)
+                    print(f"\n{'='*60}")
+                    print(f"🎉 VALID KEY FOUND! [{service}]")
+                    print(f"   Key: {key}")
+                    print(f"   Source: {source_url[:80]}")
+                    print(f"   Status: {info}")
+                    print(f"{'='*60}\n")
+                    with open("valid_keys_realtime.txt", "a") as f:
+                        f.write(f"{ts.strftime('%Y-%m-%d %H:%M:%S')} | {service} | {key} | {info} | {source_url}\n")
             except:
                 pass
     
-    if results:
-        with valid_lock:
-            for r in results:
-                found_valid_keys.append(r)
-                key, service, balance, info, source_url, source_type, _ = r
-                print(f"\n{'='*60}")
-                print(f"🎉 VALID KEY FOUND! [{service}]")
-                print(f"   Key: {key}")
-                print(f"   Source: {source_url[:80]}")
-                print(f"   Status: {info}")
-                print(f"{'='*60}\n")
-                with open("valid_keys_realtime.txt", "a") as f:
-                    f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | {service} | {key} | {info} | {source_url}\n")
-    
-    safe_print(f"[Worker-{worker_id}] Batch done: {len(results)} valid keys")
+    safe_print(f"[Worker-{worker_id}] Batch done: {len(results)} valid keys found")
 
 def add_key_to_pending(worker_id, key, service, source_url, source_type):
     if worker_id not in batch_locks:
@@ -365,11 +364,11 @@ def process_item(item, item_type, worker_id):
         message = item.get("commit", {}).get("message", "")
         full_text = message
     key_count = sum(len(pattern.findall(full_text)) for pattern in KEY_PATTERNS.values())
-    if key_count > 30:
+    if key_count > 50:
         return
     extract_and_queue(full_text, url, f"{item_type}_body", worker_id)
 
-# ========== 搜索 Worker ==========
+# ========== 搜索 Worker（放宽限制版） ==========
 def search_worker(worker_id, search_type, start_page):
     safe_print(f"[Worker-{worker_id}] Starting {search_type} scan from page {start_page}")
     query = ISSUE_QUERY if search_type == "issue" else COMMIT_QUERY
@@ -377,35 +376,60 @@ def search_worker(worker_id, search_type, start_page):
     encoded = urllib.parse.quote(query)
     page = start_page
     items_processed = 0
+    consecutive_empty = 0
     
     while not stop_event.is_set() and page <= MAX_PAGES:
         check_timeout()
         heartbeat()
+        
         url = f"{GITHUB_API}/search/{api_path}?q={encoded}&sort=created&order=desc&per_page={PER_PAGE}&page={page}"
         try:
             code, data = _http_request(url, headers=_gh_headers(), timeout=REQUEST_TIMEOUT)
+            
+            if code == 403:
+                safe_print(f"[Worker-{worker_id}] {search_type} page {page}: HTTP 403, waiting 60s...")
+                time.sleep(60)
+                continue
+            
             if code != 200:
-                safe_print(f"[Worker-{worker_id}] {search_type} page {page}: HTTP {code}")
+                safe_print(f"[Worker-{worker_id}] {search_type} page {page}: HTTP {code}, continuing")
                 page += 1
                 time.sleep(2)
                 continue
+            
             if not isinstance(data, dict):
-                break
+                page += 1
+                continue
+            
             items = data.get("items", [])
+            
             if not items:
-                break
-            safe_print(f"[Worker-{worker_id}] {search_type} page {page}: {len(items)} items")
+                consecutive_empty += 1
+                if consecutive_empty >= 5:
+                    safe_print(f"[Worker-{worker_id}] {search_type} no more results (stopping)")
+                    break
+                page += 1
+                time.sleep(1)
+                continue
+            
+            consecutive_empty = 0
+            
+            safe_print(f"[Worker-{worker_id}] {search_type} page {page}: {len(items)} items (total: {items_processed + len(items)})")
+            
             for item in items:
                 if stop_event.is_set():
                     break
                 process_item(item, search_type, worker_id)
                 items_processed += 1
+            
             page += 1
             time.sleep(0.5)
+            
         except Exception as e:
-            safe_print(f"[Worker-{worker_id}] Error: {e}")
+            safe_print(f"[Worker-{worker_id}] Error on page {page}: {e}")
             page += 1
-            time.sleep(2)
+            time.sleep(5)
+            continue
     
     with batch_locks.get(worker_id, Lock()):
         if pending_count.get(worker_id, 0) > 0:
@@ -413,6 +437,7 @@ def search_worker(worker_id, search_type, start_page):
             if batch:
                 safe_print(f"[Worker-{worker_id}] Processing remaining {len(batch)} keys")
                 verify_batch(worker_id, batch)
+    
     safe_print(f"[Worker-{worker_id}] Finished, processed {items_processed} items")
 
 # ========== 主函数 ==========
@@ -420,7 +445,7 @@ def main():
     print("=" * 70)
     print("API Key Leak Scanner - Stable Version")
     print(f"Supports: OpenAI (sk-proj-), OpenRouter, DeepSeek, Gemini, Anthropic, Cohere, Replicate, HuggingFace, MiMo")
-    print(f"Batch size: {BATCH_SIZE} | Max runtime: {MAX_RUNTIME_SECONDS}s (1.5h)")
+    print(f"Batch size: {BATCH_SIZE} | Max pages: {MAX_PAGES} | Max runtime: {MAX_RUNTIME_SECONDS}s (1.5h)")
     print("=" * 70)
     
     g = get_github_client()
@@ -431,7 +456,7 @@ def main():
     with ThreadPoolExecutor(max_workers=SEARCH_WORKERS) as executor:
         futures = [
             executor.submit(search_worker, 1, "issue", 1),
-            executor.submit(search_worker, 2, "issue", 4),
+            executor.submit(search_worker, 2, "issue", 6),
             executor.submit(search_worker, 3, "commit", 1)
         ]
         for future in as_completed(futures):
