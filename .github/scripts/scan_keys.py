@@ -17,8 +17,8 @@ from github import Github, Auth, GithubException
 MAX_RUNTIME_SECONDS = 90 * 60
 HEARTBEAT_INTERVAL = 300
 BATCH_DELAY = 5
-BATCH_SIZE = 30
-MAX_WORKERS = 10
+BATCH_SIZE = 20  # 每批取20条
+MAX_WORKERS = 5
 
 # GitHub App 配置
 APP_ID = os.environ.get("APP_ID")
@@ -50,8 +50,7 @@ start_time = time.time()
 last_heartbeat = start_time
 stop_scan = False
 
-# 拆分搜索条件 (每个查询最多5个OR，符合GitHub API限制)
-# 加上 "your key leak" 搜索
+# 拆分搜索条件 (每个查询最多5个OR)
 ISSUE_QUERIES = [
     '"your key leak"',
     '"sk-" OR "sk-proj-" OR "AIza"',
@@ -127,13 +126,17 @@ def load_state():
     try:
         with open(STATE_FILE, "r") as f:
             state = json.load(f)
-            if "issue_page" not in state:
-                state["issue_page"] = 1
-            if "commit_page" not in state:
-                state["commit_page"] = 1
+            if "replied_issues" not in state:
+                state["replied_issues"] = []
+            if "replied_commits" not in state:
+                state["replied_commits"] = []
+            if "issue_offset" not in state:
+                state["issue_offset"] = 0
+            if "commit_offset" not in state:
+                state["commit_offset"] = 0
             return state
     except:
-        return {"replied_issues": [], "replied_commits": [], "issue_page": 1, "commit_page": 1}
+        return {"replied_issues": [], "replied_commits": [], "issue_offset": 0, "commit_offset": 0}
 
 def save_state(state=None):
     if state is None:
@@ -266,27 +269,82 @@ def save_result():
         json.dump(scan_results, f, indent=2)
     print(f"💾 Saved to {fname}")
 
-def scan_issues_batch(g, state, processed, page):
-    """扫描一批 Issues (使用拆分后的查询)"""
-    print(f"\n  📄 Fetching issues page {page}...")
+def fetch_issues_with_pagination(g, query, limit=100):
+    """带分页和403重置的issue获取"""
+    all_items = []
+    page = 1
+    
+    while len(all_items) < limit and not stop_scan:
+        try:
+            items = list(g.search_issues(query, sort="created", order="desc").get_page(page))
+            if not items:
+                break
+            all_items.extend(items)
+            page += 1
+            time.sleep(0.3)
+        except GithubException as e:
+            if e.status == 403:
+                print(f"    ⚠️ 403 on page {page}, resetting to page 1")
+                page = 1
+                time.sleep(60)  # 等待60秒后继续
+                continue
+            else:
+                print(f"    Error: {e}")
+                break
+        except Exception as e:
+            print(f"    Error: {e}")
+            break
+    
+    return all_items[:limit]
+
+def fetch_commits_with_pagination(g, query, limit=100):
+    """带分页和403重置的commit获取"""
+    all_items = []
+    page = 1
+    
+    while len(all_items) < limit and not stop_scan:
+        try:
+            items = list(g.search_commits(query, sort="committer-date", order="desc").get_page(page))
+            if not items:
+                break
+            all_items.extend(items)
+            page += 1
+            time.sleep(0.3)
+        except GithubException as e:
+            if e.status == 403:
+                print(f"    ⚠️ 403 on page {page}, resetting to page 1")
+                page = 1
+                time.sleep(60)
+                continue
+            else:
+                print(f"    Error: {e}")
+                break
+        except Exception as e:
+            print(f"    Error: {e}")
+            break
+    
+    return all_items[:limit]
+
+def scan_issues_batch(g, state, processed):
+    """扫描 Issues (自动处理403，无限滚动)"""
+    print(f"\n  📄 Fetching issues...")
     all_issues = []
     seen_urls = set()
     
     for query in ISSUE_QUERIES:
-        try:
-            items = list(g.search_issues(query, sort="created", order="desc"))[:15]
-            for item in items:
-                if item.html_url not in seen_urls:
-                    seen_urls.add(item.html_url)
-                    all_issues.append(item)
-        except Exception as e:
-            print(f"    Issue search error for '{query}': {e}")
-            continue
-        time.sleep(0.3)
+        if stop_scan:
+            break
+        print(f"    Query: {query[:50]}...")
+        items = fetch_issues_with_pagination(g, query, limit=50)
+        for item in items:
+            if item.html_url not in seen_urls:
+                seen_urls.add(item.html_url)
+                all_issues.append(item)
+        time.sleep(1)
     
     if not all_issues:
         print(f"    No issues found")
-        return 0, page + 1, False
+        return 0
     
     print(f"    Found {len(all_issues)} unique issues")
     replied = 0
@@ -352,29 +410,28 @@ def scan_issues_batch(g, state, processed, page):
                         scan_results["errors"].append(str(e))
         time.sleep(0.3)
     
-    return replied, page + 1, True
+    return replied
 
-def scan_commits_batch(g, state, processed, page):
-    """扫描一批 Commits (使用拆分后的查询)"""
-    print(f"\n  📄 Fetching commits page {page}...")
+def scan_commits_batch(g, state, processed):
+    """扫描 Commits (自动处理403，无限滚动)"""
+    print(f"\n  📄 Fetching commits...")
     all_commits = []
     seen_urls = set()
     
     for query in COMMIT_QUERIES:
-        try:
-            items = list(g.search_commits(query, sort="committer-date", order="desc"))[:15]
-            for item in items:
-                if item.html_url not in seen_urls:
-                    seen_urls.add(item.html_url)
-                    all_commits.append(item)
-        except Exception as e:
-            print(f"    Commit search error for '{query}': {e}")
-            continue
-        time.sleep(0.3)
+        if stop_scan:
+            break
+        print(f"    Query: {query[:50]}...")
+        items = fetch_commits_with_pagination(g, query, limit=50)
+        for item in items:
+            if item.html_url not in seen_urls:
+                seen_urls.add(item.html_url)
+                all_commits.append(item)
+        time.sleep(1)
     
     if not all_commits:
         print(f"    No commits found")
-        return 0, page + 1, False
+        return 0
     
     print(f"    Found {len(all_commits)} unique commits")
     replied = 0
@@ -453,7 +510,7 @@ def scan_commits_batch(g, state, processed, page):
                         scan_results["errors"].append(str(e))
         time.sleep(0.3)
     
-    return replied, page + 1, True
+    return replied
 
 def check_and_reply():
     global last_heartbeat, stop_scan
@@ -462,7 +519,7 @@ def check_and_reply():
     print(f"🤖 {BOT_NAME} - API Key Leak Scanner (GitHub App)")
     print(f"📁 Self repo: {REPO_NAME}")
     print(f"⏱️  Max runtime: {MAX_RUNTIME_SECONDS}s")
-    print(f"🔍 Scanning: Issues + Commits (global search)")
+    print(f"🔄 Mode: Infinite scroll (reset on 403)")
     print(f"{'='*60}\n")
     
     g = get_github_client()
@@ -473,9 +530,7 @@ def check_and_reply():
     print("✅ GitHub App client initialized\n")
     
     state = load_state()
-    issue_page = state.get("issue_page", 1)
-    commit_page = state.get("commit_page", 1)
-    print(f"📍 Starting from issue page {issue_page}, commit page {commit_page}\n")
+    print(f"📍 Loaded state: {len(state.get('replied_issues', []))} issues, {len(state.get('replied_commits', []))} commits replied\n")
     
     processed = set()
     total_replied = 0
@@ -490,17 +545,15 @@ def check_and_reply():
         print(f"{'='*50}")
         
         # 扫描 Issues
-        issue_replied, issue_page, issue_has_more = scan_issues_batch(g, state, processed, issue_page)
+        issue_replied = scan_issues_batch(g, state, processed)
         total_replied += issue_replied
         check_timeout()
         
         # 扫描 Commits
-        commit_replied, commit_page, commit_has_more = scan_commits_batch(g, state, processed, commit_page)
+        commit_replied = scan_commits_batch(g, state, processed)
         total_replied += commit_replied
         
         # 保存进度
-        state["issue_page"] = issue_page
-        state["commit_page"] = commit_page
         save_state(state)
         
         print(f"\n📊 Batch #{batch_count} summary:")
@@ -508,10 +561,6 @@ def check_and_reply():
         print(f"   ✅ Commits replied: {commit_replied}")
         print(f"   📈 Total replied: {total_replied}")
         print(f"   📊 Keys found: {len(scan_results['found_keys'])}")
-        
-        if not issue_has_more and not commit_has_more:
-            print(f"\n✅ No more results. Scan complete.")
-            break
         
         print(f"\n💤 Waiting {BATCH_DELAY}s...")
         for i in range(BATCH_DELAY):
