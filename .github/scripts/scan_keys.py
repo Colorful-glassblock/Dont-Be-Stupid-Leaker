@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 API Key Leak Scanner - Full Content Extraction with Cache Management
-- Fetches complete content for all source types
+- Fetches complete content for all source types (Code/Issues/PRs/Commits)
 - Creates issues without labels if label creation fails
 - Random browser User-Agent for all HTTP requests
 - Auto-verify on batch size OR 60s timeout
 - LRU cache with size and TTL limits to prevent OOM
+- Replies to Issues and PRs directly in original repository
 """
 
 import os
@@ -483,32 +484,60 @@ def get_full_commit_content(g, source_url):
         print(f"    ⚠️ Failed to fetch commit: {e}")
         return None
 
-# ========== 在原仓库回复 Issue ==========
-def reply_to_original_issue(g, source_url, author, service, key, info, balance):
-    if "/issues/" not in source_url:
-        return False
+# ========== 在原仓库回复 Issue 或 PR ==========
+def reply_to_original_issue_or_pr(g, source_url, author, service, key, info, balance):
+    """在原仓库的 Issue 或 PR 评论区回复"""
     try:
-        parts = source_url.replace("https://github.com/", "").split("/issues/")
+        # 判断是 Issue 还是 PR
+        if "/issues/" in source_url:
+            parts = source_url.replace("https://github.com/", "").split("/issues/")
+            is_pr = False
+        elif "/pull/" in source_url:
+            parts = source_url.replace("https://github.com/", "").split("/pull/")
+            is_pr = True
+        else:
+            return False
+        
+        if len(parts) != 2:
+            return False
+        
         repo_path = parts[0]
-        issue_num = int(parts[1])
+        item_num = int(parts[1])
         repo = g.get_repo(repo_path)
-        issue = repo.get_issue(number=issue_num)
-
+        
+        # 获取 Issue 或 PR
+        if is_pr:
+            item = repo.get_pull(number=item_num)
+            comment_func = item.create_issue_comment
+            item_type = "PR"
+        else:
+            item = repo.get_issue(number=item_num)
+            comment_func = item.create_comment
+            item_type = "Issue"
+        
+        # 检查是否已经回复过
         bot_login = g.get_user().login
-        for comment in issue.get_comments():
+        if is_pr:
+            comments = item.get_issue_comments()
+        else:
+            comments = item.get_comments()
+        
+        for comment in comments:
             if comment.user.login == bot_login and "API Key Leak Detected" in comment.body:
-                print(f"    ⏭️ Already replied to issue #{issue_num} in {repo_path}")
+                print(f"    ⏭️ Already replied to {item_type} #{item_num} in {repo_path}")
                 return True
-
-        message = build_reply(author, service, key, info, source_url, "issue", balance, is_fallback=False)
-        issue.create_comment(message)
-        print(f"    📝 Replied to issue #{issue_num} in {repo_path}")
+        
+        # 发送回复
+        message = build_reply(author, service, key, info, source_url, item_type.lower(), balance, is_fallback=False)
+        comment_func(message)
+        print(f"    📝 Replied to {item_type} #{item_num} in {repo_path}")
         return True
+        
     except Exception as e:
-        print(f"    ❌ Failed to reply to issue: {e}")
+        print(f"    ❌ Failed to reply: {e}")
         return False
 
-# ========== 在原仓库为代码文件创建 Issue（带标签回退） ==========
+# ========== 在原仓库为代码文件创建 Issue（带标签回退 + NoneType修复） ==========
 def create_issue_in_original_repo(g, source_url, author, service, key, info, balance):
     if "/blob/" not in source_url:
         return False
@@ -520,16 +549,27 @@ def create_issue_in_original_repo(g, source_url, author, service, key, info, bal
         file_path = parts[1]
         repo = g.get_repo(repo_path)
 
-        existing = repo.get_issues(state="all")
-        for issue in existing:
-            if file_path in issue.title or source_url in issue.body:
-                print(f"    ⏭️ Issue already exists for {file_path} in {repo_path}")
-                return True
+        # 检查是否已存在相同文件的 issue - 修复 NoneType 错误
+        already_exists = False
+        try:
+            issues = repo.get_issues(state="all")
+            if issues is not None:
+                for issue in issues:
+                    if file_path in issue.title or source_url in issue.body:
+                        already_exists = True
+                        print(f"    ⏭️ Issue already exists for {file_path} in {repo_path}")
+                        break
+        except Exception as e:
+            print(f"    ⚠️ Could not check existing issues: {e}")
+
+        if already_exists:
+            return True
 
         message = build_reply(author, service, key, info, source_url, "code file", balance, is_fallback=False)
         issue_title = f"🔴 API Key Leak Detected in {file_path}"
         issue_body = message + f"\n\n**File:** `{file_path}`"
         
+        # 先尝试带标签创建
         try:
             new_issue = repo.create_issue(title=issue_title, body=issue_body, labels=["security"])
             print(f"    📝 Created issue in {repo_path} for file {file_path} (with labels)")
@@ -551,22 +591,24 @@ def create_issue_in_original_repo(g, source_url, author, service, key, info, bal
         print(f"    ❌ Failed to create issue in original repo: {e}")
         return False
 
-# ========== 在本仓库创建 Issue（带标签回退） ==========
+# ========== 在本仓库创建 Issue（带标签回退 + NoneType修复） ==========
 def create_issue_in_my_repo(g, key, service, info, source_url, source_type, author, balance, is_fallback=False):
     message = build_reply(author, service, key, info, source_url, source_type, balance, is_fallback=is_fallback)
 
     try:
         my_repo = g.get_repo(REPO_NAME)
 
+        # 检查是否已存在 - 修复 NoneType 错误
         already_exists = False
         existing_issue_num = None
         try:
             issues = my_repo.get_issues(state="all")
-            for issue in issues:
-                if source_url in issue.body:
-                    already_exists = True
-                    existing_issue_num = issue.number
-                    break
+            if issues is not None:
+                for issue in issues:
+                    if source_url in issue.body:
+                        already_exists = True
+                        existing_issue_num = issue.number
+                        break
         except Exception as e:
             print(f"    ⚠️ Failed to check existing issues: {e}")
 
@@ -611,6 +653,7 @@ def create_issue_in_my_repo(g, key, service, info, source_url, source_type, auth
 
 *Auto-generated by {BOT_NAME}*
 """
+        # 先尝试带标签创建
         try:
             new_issue = my_repo.create_issue(title=issue_title, body=issue_body, labels=["security", "leak"])
             print(f"    📝 Created issue #{new_issue.number} in {REPO_NAME} (with labels)")
@@ -631,28 +674,39 @@ def handle_leak(g, key, service, info, source_url, source_type, author, balance)
             print(f"    ⏭️ Already processed this source, skipping")
             return
         processed_sources.add(source_url)
-
-    if "/issues/" in source_url:
-        original_success = reply_to_original_issue(g, source_url, author, service, key, info, balance)
+    
+    # 判断来源类型
+    if "/issues/" in source_url or "/pull/" in source_url:
+        # Issue 或 PR：在原仓库评论区回复
+        original_success = reply_to_original_issue_or_pr(g, source_url, author, service, key, info, balance)
+        # 无论原仓库回复是否成功，都在自己的仓库创建记录
         create_issue_in_my_repo(g, key, service, info, source_url, source_type, author, balance, is_fallback=not original_success)
-
+    
     elif "/blob/" in source_url:
+        # 代码文件：在原仓库创建 Issue
         original_success = create_issue_in_original_repo(g, source_url, author, service, key, info, balance)
         create_issue_in_my_repo(g, key, service, info, source_url, source_type, author, balance, is_fallback=not original_success)
-
-    elif "/pull/" in source_url or "/commit/" in source_url:
+    
+    elif "/commit/" in source_url:
+        # Commit：只在自己的仓库创建 Issue
         create_issue_in_my_repo(g, key, service, info, source_url, source_type, author, balance, is_fallback=False)
-        print(f"    ℹ️ PR/Commit source, only created issue in fallback repo")
-
+        print(f"    ℹ️ Commit source, only created issue in fallback repo")
+    
     else:
+        # 其他：只在自己的仓库记录
         create_issue_in_my_repo(g, key, service, info, source_url, source_type, author, balance, is_fallback=False)
         print(f"    ⚠️ Unknown source type, only created issue in fallback repo")
 
-# ========== 验证批次 ==========
+# ========== 验证批次（带详细输出） ==========
 def verify_batch(worker_id, batch, g):
     if not batch:
         return
-    safe_print(f"\n[Worker-{worker_id}] 🔍 Verifying {len(batch)} keys...")
+    
+    is_timeout_trigger = len(batch) < BATCH_SIZE
+    if is_timeout_trigger:
+        safe_print(f"\n[Worker-{worker_id}] ⏰ Verifying timeout batch: {len(batch)} keys (triggered by {BATCH_TIMEOUT}s timeout)")
+    else:
+        safe_print(f"\n[Worker-{worker_id}] 🔍 Verifying full batch: {len(batch)} keys")
 
     def verify_one(key_info):
         key, service, source_url, source_type, author = key_info
@@ -677,10 +731,13 @@ def verify_batch(worker_id, batch, g):
 
     with ThreadPoolExecutor(max_workers=VERIFY_WORKERS) as executor:
         futures = [executor.submit(verify_one, ki) for ki in batch]
+        valid_count = 0
+        invalid_count = 0
         for future in as_completed(futures):
             try:
                 key, service, valid, balance, info, source_url, source_type, author = future.result(timeout=15)
                 if valid:
+                    valid_count += 1
                     print(f"  ✅ [{service}] {key[:25]}... -> {info}")
                     print(f"     📍 Source: {source_url}")
 
@@ -690,11 +747,18 @@ def verify_batch(worker_id, batch, g):
                         f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | {service} | {key} | {info} | {source_url}\n")
 
                     handle_leak(g, key, service, info, source_url, source_type, author, balance)
-
                 else:
-                    pass
+                    invalid_count += 1
+                    print(f"  ❌ [{service}] {key[:25]}... -> {info}")
+                    print(f"     📍 Source: {source_url}")
             except Exception as e:
+                invalid_count += 1
                 print(f"  ❌ Exception: {e}")
+        
+        if is_timeout_trigger:
+            safe_print(f"[Worker-{worker_id}] 📊 Timeout batch completed: {valid_count} valid, {invalid_count} invalid (total {len(batch)})")
+        else:
+            safe_print(f"[Worker-{worker_id}] 📊 Batch completed: {valid_count}/{len(batch)} valid keys")
 
 def check_pending_timeout(worker_id, g):
     with batch_locks.get(worker_id, Lock()):
@@ -738,43 +802,59 @@ def add_key_to_pending(worker_id, key, service, source_url, source_type, author,
             executor.submit(verify_batch, worker_id, batch, g)
             executor.shutdown(wait=False)
 
-# ========== 提取和队列（带完整内容获取） ==========
+# ========== 提取和队列（强制获取完整内容） ==========
 def extract_and_queue(text, source_url, source_type, worker_id, author, g):
     full_text = text
     
-    if "/blob/" in source_url and source_type == "code":
+    # 根据来源类型获取完整内容 - 只要有可能，就获取完整内容
+    if source_type == "code" and "/blob/" in source_url:
+        # Code: 获取完整文件
         file_content = get_full_file_content(source_url)
         if file_content:
             full_text = file_content
-            print(f"    📄 Using full file content for code")
+            print(f"    📄 Using full file content for code (all keys from this file)")
+        else:
+            full_text = text
     
-    elif "/issues/" in source_url and source_type == "issue":
+    elif source_type == "issue" and "/issues/" in source_url:
+        # Issue: 获取完整 Issue 内容
         issue_content = get_full_issue_content(g, source_url)
         if issue_content:
             full_text = issue_content
-            print(f"    📄 Using full issue content (body + comments)")
+            print(f"    📄 Using full issue content (title + body + comments)")
+        else:
+            full_text = text
     
     elif "/pull/" in source_url:
+        # PR: 获取完整 PR 内容
         pr_content = get_full_pr_content(g, source_url)
         if pr_content:
             full_text = pr_content
             print(f"    📄 Using full PR content (description + comments + diff)")
+        else:
+            full_text = text
     
-    elif "/commit/" in source_url and source_type == "commit":
+    elif source_type == "commit" and "/commit/" in source_url:
+        # Commit: 获取完整 commit diff
         commit_content = get_full_commit_content(g, source_url)
         if commit_content:
             full_text = commit_content
             print(f"    📄 Using full commit diff")
+        else:
+            full_text = text
     
+    # 从完整内容中提取所有 Key
     for service, pattern in KEY_PATTERNS.items():
         for match in pattern.finditer(full_text):
             key = match.group(0)
+            # 去重检查
             with valid_lock:
                 if any(key == k for k, _, _, _, _, _, _ in found_valid_keys):
                     continue
             print(f"  🔑 Found {service} key in {source_type}: {source_url[:80]}...")
             add_key_to_pending(worker_id, key, service, source_url, source_type, author, g)
     
+    # 检查是否有超时的批次
     check_pending_timeout(worker_id, g)
 
 # ========== 搜索 Workers ==========
@@ -824,14 +904,8 @@ def search_code_worker(worker_id, start_page, g):
                 html_url = item.get("html_url", "")
                 author = item.get("repository", {}).get("owner", {}).get("login", "unknown")
                 
-                snippet = ""
-                if "text_matches" in item:
-                    for match in item.get("text_matches", []):
-                        snippet += match.get("fragment", "") + "\n"
-                if not snippet:
-                    snippet = item.get("name", "") + " " + item.get("path", "")
-                
-                extract_and_queue(snippet, html_url, "code", worker_id, author, g)
+                # 传入空字符串，强制获取完整文件内容
+                extract_and_queue("", html_url, "code", worker_id, author, g)
                 items_processed += 1
 
             page += 1
@@ -888,20 +962,11 @@ def search_issues_worker(worker_id, start_page, g):
             for item in items:
                 if stop_event.is_set():
                     break
-                title = item.get("title", "")
-                body = item.get("body", "") or ""
+                html_url = item.get("html_url", "")
                 author = item.get("user", {}).get("login", "unknown")
-                full_text = title + "\n" + body
-                try:
-                    comments_url = item.get("comments_url", "")
-                    if comments_url:
-                        ccode, cdata = _http_request(comments_url, headers=_gh_headers(), timeout=10)
-                        if ccode == 200 and isinstance(cdata, list):
-                            for comment in cdata:
-                                full_text += f"\n{comment.get('body', '')}"
-                except:
-                    pass
-                extract_and_queue(full_text, item.get("html_url", ""), "issue", worker_id, author, g)
+                
+                # 传入空字符串，强制获取完整 Issue 内容
+                extract_and_queue("", html_url, "issue", worker_id, author, g)
                 items_processed += 1
 
             page += 1
@@ -957,21 +1022,11 @@ def search_commits_worker(worker_id, start_page, g):
             for item in items:
                 if stop_event.is_set():
                     break
-                message = item.get("commit", {}).get("message", "")
+                html_url = item.get("html_url", "")
                 author = item.get("author", {}).get("login", "unknown") if item.get("author") else "unknown"
-                full_text = message
-                try:
-                    diff_url = item.get("html_url", "").replace("github.com", "api.github.com/repos")
-                    diff_url = diff_url.replace("/commit/", "/commits/")
-                    dcode, ddata = _http_request(diff_url, headers=_gh_headers(), timeout=10)
-                    if dcode == 200 and isinstance(ddata, dict):
-                        for f in ddata.get("files", []):
-                            patch = f.get("patch", "")
-                            if patch:
-                                full_text += "\n" + patch
-                except:
-                    pass
-                extract_and_queue(full_text, item.get("html_url", ""), "commit", worker_id, author, g)
+                
+                # 传入空字符串，强制获取完整 Commit 内容
+                extract_and_queue("", html_url, "commit", worker_id, author, g)
                 items_processed += 1
 
             page += 1
@@ -992,6 +1047,8 @@ def main():
     print(f"📦 Batch size: {BATCH_SIZE} keys OR {BATCH_TIMEOUT}s timeout")
     print(f"💾 Cache: max {MAX_CACHE_SIZE} items, TTL {MAX_CACHE_AGE}s")
     print("📊 Scanning: CODE + ISSUES + COMMITS (infinite pages)")
+    print("📊 Feature: Full content extraction for all sources (no key left behind)")
+    print("📊 Notification: Issues/PRs get direct replies; Code files get issues; Commits logged only")
     print("=" * 70)
 
     g = get_github_client()
