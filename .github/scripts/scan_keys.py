@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-API Key Leak Scanner - Full Version with Complete Content Extraction
-- Fetches complete content for all source types (Code/Issues/PRs/Commits)
-- Caches file content to avoid re-downloads
+API Key Leak Scanner - Full Content Extraction with Cache Management
+- Fetches complete content for all source types
+- Creates issues without labels if label creation fails
+- Random browser User-Agent for all HTTP requests
+- Auto-verify on batch size OR 60s timeout
+- LRU cache with size and TTL limits to prevent OOM
 """
 
 import os
@@ -13,6 +16,7 @@ import ssl
 import jwt
 import time
 import signal
+import random
 import requests
 import urllib.parse
 import urllib.request
@@ -31,6 +35,11 @@ PER_PAGE = 30
 SEARCH_WORKERS = 4
 VERIFY_WORKERS = 30
 BATCH_SIZE = 30
+BATCH_TIMEOUT = 60
+
+# 缓存配置
+MAX_CACHE_SIZE = 200      # 最多缓存200项
+MAX_CACHE_AGE = 3600      # 缓存有效期1小时
 
 APP_ID = os.environ.get("APP_ID")
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY")
@@ -55,19 +64,76 @@ last_heartbeat = start_time
 stop_event = Event()
 found_valid_keys: List[Tuple] = []
 valid_lock = Lock()
+
+# pending 批次管理
 pending_batches: Dict[int, List[Tuple]] = defaultdict(list)
+pending_batch_times: Dict[int, float] = {}
 batch_locks: Dict[int, Lock] = {}
 pending_count: Dict[int, int] = defaultdict(int)
 
 processed_sources: set = set()
 processed_lock = Lock()
 
-# 缓存
-file_content_cache: Dict[str, str] = {}
-issue_content_cache: Dict[str, str] = {}
-pr_content_cache: Dict[str, str] = {}
-commit_content_cache: Dict[str, str] = {}
+# 带时间戳的缓存
+file_content_cache: Dict[str, Tuple[str, float]] = {}
+issue_content_cache: Dict[str, Tuple[str, float]] = {}
+pr_content_cache: Dict[str, Tuple[str, float]] = {}
+commit_content_cache: Dict[str, Tuple[str, float]] = {}
 cache_lock = Lock()
+
+# ========== 随机 User-Agent 池 ==========
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+]
+
+def random_ua():
+    return random.choice(USER_AGENTS)
+
+# ========== 缓存管理 ==========
+def clean_old_cache(cache_dict, max_size=MAX_CACHE_SIZE, max_age=MAX_CACHE_AGE):
+    """清理过期和过多的缓存"""
+    now = time.time()
+    # 删除过期的
+    expired = [k for k, (_, ts) in cache_dict.items() if now - ts > max_age]
+    for k in expired:
+        del cache_dict[k]
+    
+    # 如果还是太多，删除最旧的
+    if len(cache_dict) > max_size:
+        sorted_items = sorted(cache_dict.items(), key=lambda x: x[1][1])
+        for k, _ in sorted_items[:len(cache_dict) - max_size]:
+            del cache_dict[k]
+    
+    return len(cache_dict)
+
+def get_cached(cache_dict, key):
+    with cache_lock:
+        if key in cache_dict:
+            content, timestamp = cache_dict[key]
+            if time.time() - timestamp < MAX_CACHE_AGE:
+                return content
+            else:
+                del cache_dict[key]
+    return None
+
+def set_cached(cache_dict, key, content):
+    with cache_lock:
+        cache_dict[key] = (content, time.time())
+        if len(cache_dict) > MAX_CACHE_SIZE + 50:
+            clean_old_cache(cache_dict)
+
+def print_cache_stats():
+    with cache_lock:
+        file_count = len(file_content_cache)
+        issue_count = len(issue_content_cache)
+        pr_count = len(pr_content_cache)
+        commit_count = len(commit_content_cache)
+        total = file_count + issue_count + pr_count + commit_count
+        print(f"📊 Cache: files={file_count}, issues={issue_count}, PRs={pr_count}, commits={commit_count}, total={total}")
 
 # ========== Key 正则 ==========
 KEY_PATTERNS = {
@@ -199,7 +265,7 @@ def get_github_client():
 
 # ========== 工具函数 ==========
 def _gh_headers():
-    headers = {"Accept": "application/vnd.github+json", "User-Agent": "KeyScanner"}
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": random_ua()}
     if PAT_TOKEN:
         headers["Authorization"] = f"Bearer {PAT_TOKEN}"
     return headers
@@ -240,6 +306,7 @@ def heartbeat():
         elapsed = now - start_time
         remaining = MAX_RUNTIME_SECONDS - elapsed
         print(f"[❤️] Alive: {elapsed:.0f}s / {MAX_RUNTIME_SECONDS}s (remaining: {remaining:.0f}s)")
+        print_cache_stats()
         last_heartbeat = now
 
 def signal_handler(sig, frame):
@@ -296,22 +363,21 @@ https://github.com/apps/llmapicheckbot2
 ---
 {BOT_SIGNATURE}{install_note}"""
 
-# ========== 获取完整内容函数 ==========
+# ========== 获取完整内容函数（带缓存） ==========
 def get_full_file_content(source_url):
-    """获取完整文件内容"""
     cache_key = source_url.split("/blob/")[0] + source_url.split("/blob/")[1] if "/blob/" in source_url else source_url
     
-    with cache_lock:
-        if cache_key in file_content_cache:
-            return file_content_cache[cache_key]
+    cached = get_cached(file_content_cache, cache_key)
+    if cached is not None:
+        return cached
     
     raw_url = source_url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
     try:
-        resp = requests.get(raw_url, timeout=10)
+        headers = {"User-Agent": random_ua()}
+        resp = requests.get(raw_url, headers=headers, timeout=10)
         if resp.status_code == 200:
             content = resp.text
-            with cache_lock:
-                file_content_cache[cache_key] = content
+            set_cached(file_content_cache, cache_key, content)
             print(f"    📄 Fetched full file: {source_url[:80]}...")
             return content
     except Exception as e:
@@ -319,10 +385,9 @@ def get_full_file_content(source_url):
     return None
 
 def get_full_issue_content(g, source_url):
-    """获取完整 Issue 内容（标题 + 正文 + 所有评论）"""
-    with cache_lock:
-        if source_url in issue_content_cache:
-            return issue_content_cache[source_url]
+    cached = get_cached(issue_content_cache, source_url)
+    if cached is not None:
+        return cached
     
     try:
         parts = source_url.replace("https://github.com/", "").split("/issues/")
@@ -336,13 +401,11 @@ def get_full_issue_content(g, source_url):
         
         content = f"# {issue.title}\n\n{issue.body or ''}\n\n"
         
-        # 获取评论
         comments = issue.get_comments()
         for i, comment in enumerate(comments):
             content += f"\n## Comment by {comment.user.login}\n{comment.body or ''}\n"
         
-        with cache_lock:
-            issue_content_cache[source_url] = content
+        set_cached(issue_content_cache, source_url, content)
         print(f"    📄 Fetched full issue #{issue_num} with {comments.totalCount} comments")
         return content
     except Exception as e:
@@ -350,10 +413,9 @@ def get_full_issue_content(g, source_url):
         return None
 
 def get_full_pr_content(g, source_url):
-    """获取完整 PR 内容（描述 + 所有评论 + 文件 diff）"""
-    with cache_lock:
-        if source_url in pr_content_cache:
-            return pr_content_cache[source_url]
+    cached = get_cached(pr_content_cache, source_url)
+    if cached is not None:
+        return cached
     
     try:
         parts = source_url.replace("https://github.com/", "").split("/pull/")
@@ -367,27 +429,24 @@ def get_full_pr_content(g, source_url):
         
         content = f"# {pr.title}\n\n{pr.body or ''}\n\n"
         
-        # 获取评论
         comments = pr.get_issue_comments()
         for comment in comments:
             content += f"\n## Comment by {comment.user.login}\n{comment.body or ''}\n"
         
-        # 获取 review comments
         review_comments = pr.get_review_comments()
         for rc in review_comments:
             content += f"\n## Review Comment by {rc.user.login}\n{rc.body or ''}\n"
         
-        # 获取 diff
         diff_url = f"https://patch-diff.githubusercontent.com/raw/{repo_path}/pull/{pr_num}.diff"
+        headers = {"User-Agent": random_ua()}
         try:
-            resp = requests.get(diff_url, timeout=10)
+            resp = requests.get(diff_url, headers=headers, timeout=10)
             if resp.status_code == 200:
                 content += f"\n## Diff\n{resp.text}\n"
         except:
             pass
         
-        with cache_lock:
-            pr_content_cache[source_url] = content
+        set_cached(pr_content_cache, source_url, content)
         print(f"    📄 Fetched full PR #{pr_num}")
         return content
     except Exception as e:
@@ -395,10 +454,9 @@ def get_full_pr_content(g, source_url):
         return None
 
 def get_full_commit_content(g, source_url):
-    """获取完整 Commit 内容（消息 + diff）"""
-    with cache_lock:
-        if source_url in commit_content_cache:
-            return commit_content_cache[source_url]
+    cached = get_cached(commit_content_cache, source_url)
+    if cached is not None:
+        return cached
     
     try:
         parts = source_url.replace("https://github.com/", "").split("/commit/")
@@ -412,15 +470,13 @@ def get_full_commit_content(g, source_url):
         
         content = f"# {commit.commit.message}\n\n"
         
-        # 获取 diff
         files = commit.files
         for f in files:
             content += f"\n## {f.filename}\n"
             if f.patch:
                 content += f"{f.patch}\n"
         
-        with cache_lock:
-            commit_content_cache[source_url] = content
+        set_cached(commit_content_cache, source_url, content)
         print(f"    📄 Fetched full commit {commit_sha[:8]}")
         return content
     except Exception as e:
@@ -452,17 +508,19 @@ def reply_to_original_issue(g, source_url, author, service, key, info, balance):
         print(f"    ❌ Failed to reply to issue: {e}")
         return False
 
-# ========== 在原仓库为代码文件创建 Issue ==========
+# ========== 在原仓库为代码文件创建 Issue（带标签回退） ==========
 def create_issue_in_original_repo(g, source_url, author, service, key, info, balance):
     if "/blob/" not in source_url:
         return False
     try:
         parts = source_url.replace("https://github.com/", "").split("/blob/")
+        if len(parts) != 2:
+            return False
         repo_path = parts[0]
         file_path = parts[1]
         repo = g.get_repo(repo_path)
 
-        existing = repo.get_issues(state="all", labels=["security"])
+        existing = repo.get_issues(state="all")
         for issue in existing:
             if file_path in issue.title or source_url in issue.body:
                 print(f"    ⏭️ Issue already exists for {file_path} in {repo_path}")
@@ -471,14 +529,29 @@ def create_issue_in_original_repo(g, source_url, author, service, key, info, bal
         message = build_reply(author, service, key, info, source_url, "code file", balance, is_fallback=False)
         issue_title = f"🔴 API Key Leak Detected in {file_path}"
         issue_body = message + f"\n\n**File:** `{file_path}`"
-        repo.create_issue(title=issue_title, body=issue_body, labels=["security"])
-        print(f"    📝 Created issue in {repo_path} for file {file_path}")
-        return True
+        
+        try:
+            new_issue = repo.create_issue(title=issue_title, body=issue_body, labels=["security"])
+            print(f"    📝 Created issue in {repo_path} for file {file_path} (with labels)")
+            return True
+        except Exception as e:
+            if "labels" in str(e).lower() or "permission" in str(e).lower():
+                print(f"    ⚠️ Cannot create labels in {repo_path}, retrying without labels...")
+                try:
+                    new_issue = repo.create_issue(title=issue_title, body=issue_body)
+                    print(f"    📝 Created issue in {repo_path} for file {file_path} (without labels)")
+                    return True
+                except Exception as e2:
+                    print(f"    ❌ Failed to create issue even without labels: {e2}")
+                    return False
+            else:
+                print(f"    ❌ Failed to create issue: {e}")
+                return False
     except Exception as e:
         print(f"    ❌ Failed to create issue in original repo: {e}")
         return False
 
-# ========== 在本仓库创建 Issue ==========
+# ========== 在本仓库创建 Issue（带标签回退） ==========
 def create_issue_in_my_repo(g, key, service, info, source_url, source_type, author, balance, is_fallback=False):
     message = build_reply(author, service, key, info, source_url, source_type, balance, is_fallback=is_fallback)
 
@@ -488,7 +561,7 @@ def create_issue_in_my_repo(g, key, service, info, source_url, source_type, auth
         already_exists = False
         existing_issue_num = None
         try:
-            issues = my_repo.get_issues(state="all", labels=["leak", "security"])
+            issues = my_repo.get_issues(state="all")
             for issue in issues:
                 if source_url in issue.body:
                     already_exists = True
@@ -538,8 +611,16 @@ def create_issue_in_my_repo(g, key, service, info, source_url, source_type, auth
 
 *Auto-generated by {BOT_NAME}*
 """
-        new_issue = my_repo.create_issue(title=issue_title, body=issue_body, labels=["security", "leak"])
-        print(f"    📝 Created issue #{new_issue.number} in {REPO_NAME}")
+        try:
+            new_issue = my_repo.create_issue(title=issue_title, body=issue_body, labels=["security", "leak"])
+            print(f"    📝 Created issue #{new_issue.number} in {REPO_NAME} (with labels)")
+        except Exception as e:
+            if "labels" in str(e).lower() or "permission" in str(e).lower():
+                print(f"    ⚠️ Cannot create labels in {REPO_NAME}, retrying without labels...")
+                new_issue = my_repo.create_issue(title=issue_title, body=issue_body)
+                print(f"    📝 Created issue #{new_issue.number} in {REPO_NAME} (without labels)")
+            else:
+                raise
     except Exception as e:
         print(f"    ❌ Failed to create issue in my repo: {e}")
 
@@ -581,7 +662,7 @@ def verify_batch(worker_id, batch, g):
         try:
             url = verifier["url"](key) if callable(verifier["url"]) else verifier["url"]
             headers = verifier["headers"](key)
-            headers["User-Agent"] = "KeyScanner"
+            headers["User-Agent"] = random_ua()
             body = verifier.get("body")
             if body:
                 body = body()
@@ -611,31 +692,56 @@ def verify_batch(worker_id, batch, g):
                     handle_leak(g, key, service, info, source_url, source_type, author, balance)
 
                 else:
-                    print(f"  ❌ [{service}] {key[:25]}... -> {info}")
-                    print(f"     📍 Source: {source_url}")
+                    pass
             except Exception as e:
                 print(f"  ❌ Exception: {e}")
+
+def check_pending_timeout(worker_id, g):
+    with batch_locks.get(worker_id, Lock()):
+        if pending_count.get(worker_id, 0) > 0:
+            elapsed = time.time() - pending_batch_times.get(worker_id, start_time)
+            if elapsed >= BATCH_TIMEOUT:
+                batch = pending_batches[worker_id].copy()
+                pending_batches[worker_id].clear()
+                count = pending_count[worker_id]
+                pending_count[worker_id] = 0
+                if worker_id in pending_batch_times:
+                    del pending_batch_times[worker_id]
+                
+                safe_print(f"[Worker-{worker_id}] ⏰ Triggering verification by timeout ({elapsed:.0f}s, {count} keys)")
+                executor = ThreadPoolExecutor(max_workers=1)
+                executor.submit(verify_batch, worker_id, batch, g)
+                executor.shutdown(wait=False)
+                return True
+    return False
 
 def add_key_to_pending(worker_id, key, service, source_url, source_type, author, g):
     if worker_id not in batch_locks:
         batch_locks[worker_id] = Lock()
     with batch_locks[worker_id]:
+        if pending_count[worker_id] == 0:
+            pending_batch_times[worker_id] = time.time()
+        
         pending_batches[worker_id].append((key, service, source_url, source_type, author))
         pending_count[worker_id] += 1
+        
         if pending_count[worker_id] >= BATCH_SIZE:
             batch = pending_batches[worker_id].copy()
             pending_batches[worker_id].clear()
+            count = pending_count[worker_id]
             pending_count[worker_id] = 0
+            if worker_id in pending_batch_times:
+                del pending_batch_times[worker_id]
+            
+            safe_print(f"[Worker-{worker_id}] 📦 Triggering verification by batch size ({count} keys)")
             executor = ThreadPoolExecutor(max_workers=1)
             executor.submit(verify_batch, worker_id, batch, g)
             executor.shutdown(wait=False)
 
 # ========== 提取和队列（带完整内容获取） ==========
 def extract_and_queue(text, source_url, source_type, worker_id, author, g):
-    """提取 Key 并加入队列，自动获取完整内容"""
     full_text = text
     
-    # 根据来源类型获取完整内容
     if "/blob/" in source_url and source_type == "code":
         file_content = get_full_file_content(source_url)
         if file_content:
@@ -660,7 +766,6 @@ def extract_and_queue(text, source_url, source_type, worker_id, author, g):
             full_text = commit_content
             print(f"    📄 Using full commit diff")
     
-    # 从完整内容中提取所有 Key
     for service, pattern in KEY_PATTERNS.items():
         for match in pattern.finditer(full_text):
             key = match.group(0)
@@ -669,6 +774,8 @@ def extract_and_queue(text, source_url, source_type, worker_id, author, g):
                     continue
             print(f"  🔑 Found {service} key in {source_type}: {source_url[:80]}...")
             add_key_to_pending(worker_id, key, service, source_url, source_type, author, g)
+    
+    check_pending_timeout(worker_id, g)
 
 # ========== 搜索 Workers ==========
 def search_code_worker(worker_id, start_page, g):
@@ -879,16 +986,12 @@ def search_commits_worker(worker_id, start_page, g):
 
 def main():
     print("=" * 70)
-    print("🤖 API Key Leak Scanner - Full Content Extraction Version")
+    print("🤖 API Key Leak Scanner - Full Content Extraction with Cache Management")
     print(f"📁 Fallback repo: {REPO_NAME}")
     print(f"⏱️  Max runtime: {MAX_RUNTIME_SECONDS}s (29.5 minutes)")
+    print(f"📦 Batch size: {BATCH_SIZE} keys OR {BATCH_TIMEOUT}s timeout")
+    print(f"💾 Cache: max {MAX_CACHE_SIZE} items, TTL {MAX_CACHE_AGE}s")
     print("📊 Scanning: CODE + ISSUES + COMMITS (infinite pages)")
-    print("📊 Features:")
-    print("   - Full file content extraction for code")
-    print("   - Full issue content (title + body + comments)")
-    print("   - Full PR content (description + comments + diff)")
-    print("   - Full commit diff extraction")
-    print("   - Dual notification (original + fallback)")
     print("=" * 70)
 
     g = get_github_client()
