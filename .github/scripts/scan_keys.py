@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
 API Key Leak Scanner - Full Content Extraction with Cache Management
-- Fetches complete content for all source types (Code/Issues/PRs/Commits)
+- Fetches complete content for all source types (Code/Issues/PRs/Commits/Env files)
 - Creates issues without labels if label creation fails
 - Random browser User-Agent for all HTTP requests
 - Auto-verify on batch size OR 60s timeout
 - LRU cache with size and TTL limits to prevent OOM
 - Replies to Issues and PRs directly in original repository
+- Enhanced deduplication (key + source_url + combo)
+- Limited backoff (max 60 seconds)
+- Dedicated .env file scanner thread
 """
 
 import os
@@ -33,14 +36,15 @@ MAX_RUNTIME_SECONDS = 29.5 * 60
 HEARTBEAT_INTERVAL = 60
 REQUEST_TIMEOUT = 15
 PER_PAGE = 30
-SEARCH_WORKERS = 4
+SEARCH_WORKERS = 5          # 增加到5个worker
 VERIFY_WORKERS = 30
 BATCH_SIZE = 30
 BATCH_TIMEOUT = 60
+MAX_BACKOFF = 60
 
 # 缓存配置
-MAX_CACHE_SIZE = 200      # 最多缓存200项
-MAX_CACHE_AGE = 3600      # 缓存有效期1小时
+MAX_CACHE_SIZE = 200
+MAX_CACHE_AGE = 3600
 
 APP_ID = os.environ.get("APP_ID")
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY")
@@ -57,6 +61,7 @@ GITHUB_API = "https://api.github.com"
 ISSUE_QUERY = '"your key leak" OR "sk-" OR "sk-proj-" OR "xai-" OR "AIza" OR "sk-ant-api"'
 COMMIT_QUERY = 'sk- OR sk-proj- OR xai- OR AIza OR sk-ant-api'
 CODE_QUERY = 'sk- OR sk-proj- OR xai- OR AIza OR sk-ant-api'
+ENV_QUERY = 'filename:.env OR filename:.env.example OR filename:.env.local OR filename:.env.production OR filename:.env.staging'
 
 STATE_FILE = "replied_state.json"
 
@@ -72,7 +77,10 @@ pending_batch_times: Dict[int, float] = {}
 batch_locks: Dict[int, Lock] = {}
 pending_count: Dict[int, int] = defaultdict(int)
 
+# 增强去重
+processed_keys: set = set()
 processed_sources: set = set()
+processed_key_source: set = set()
 processed_lock = Lock()
 
 # 带时间戳的缓存
@@ -80,9 +88,10 @@ file_content_cache: Dict[str, Tuple[str, float]] = {}
 issue_content_cache: Dict[str, Tuple[str, float]] = {}
 pr_content_cache: Dict[str, Tuple[str, float]] = {}
 commit_content_cache: Dict[str, Tuple[str, float]] = {}
+env_content_cache: Dict[str, Tuple[str, float]] = {}
 cache_lock = Lock()
 
-# ========== 随机 User-Agent 池 ==========
+# 随机 User-Agent 池
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -94,21 +103,16 @@ USER_AGENTS = [
 def random_ua():
     return random.choice(USER_AGENTS)
 
-# ========== 缓存管理 ==========
+# 缓存管理
 def clean_old_cache(cache_dict, max_size=MAX_CACHE_SIZE, max_age=MAX_CACHE_AGE):
-    """清理过期和过多的缓存"""
     now = time.time()
-    # 删除过期的
     expired = [k for k, (_, ts) in cache_dict.items() if now - ts > max_age]
     for k in expired:
         del cache_dict[k]
-    
-    # 如果还是太多，删除最旧的
     if len(cache_dict) > max_size:
         sorted_items = sorted(cache_dict.items(), key=lambda x: x[1][1])
         for k, _ in sorted_items[:len(cache_dict) - max_size]:
             del cache_dict[k]
-    
     return len(cache_dict)
 
 def get_cached(cache_dict, key):
@@ -133,10 +137,11 @@ def print_cache_stats():
         issue_count = len(issue_content_cache)
         pr_count = len(pr_content_cache)
         commit_count = len(commit_content_cache)
-        total = file_count + issue_count + pr_count + commit_count
-        print(f"📊 Cache: files={file_count}, issues={issue_count}, PRs={pr_count}, commits={commit_count}, total={total}")
+        env_count = len(env_content_cache)
+        total = file_count + issue_count + pr_count + commit_count + env_count
+        print(f"📊 Cache: files={file_count}, issues={issue_count}, PRs={pr_count}, commits={commit_count}, env={env_count}, total={total}")
 
-# ========== Key 正则（已扩展支持更多格式） ==========
+# Key 正则
 KEY_PATTERNS = {
     "OpenAI": re.compile(r"sk-proj-[a-zA-Z0-9_\-]{50,}"),
     "OpenAI_Legacy": re.compile(r"sk-[a-zA-Z0-9]{32,}"),
@@ -151,7 +156,7 @@ KEY_PATTERNS = {
     "MiniMax": re.compile(r"sk-api-[a-zA-Z0-9]{100,}"),
 }
 
-# ========== 验证函数 ==========
+# 验证函数
 def _parse_deepseek(code, data):
     if code != 200:
         return False, 0, f"HTTP {code}"
@@ -249,7 +254,7 @@ VERIFIERS = {
     "MiniMax": {"url": "https://api.minimax.io/v1/models", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_minimax},
 }
 
-# ========== GitHub 认证 ==========
+# GitHub 认证
 def get_github_client():
     token = None
     if APP_ID and PRIVATE_KEY and INSTALLATION_ID:
@@ -271,9 +276,9 @@ def get_github_client():
         print("❌ No authentication method available")
         return None
     auth = Auth.Token(token)
-    return Github(auth=auth)
+    return Github(auth=auth, retry=0)
 
-# ========== 工具函数 ==========
+# 工具函数
 def _gh_headers():
     headers = {"Accept": "application/vnd.github+json", "User-Agent": random_ua()}
     if PAT_TOKEN:
@@ -302,11 +307,11 @@ def safe_print(msg):
 print_lock = Lock()
 
 def safe_sleep(seconds):
-    """带超时检查的 sleep"""
+    actual_sleep = min(seconds, MAX_BACKOFF)
     elapsed = 0
-    while elapsed < seconds and not stop_event.is_set():
+    while elapsed < actual_sleep and not stop_event.is_set():
         check_timeout()
-        time.sleep(min(0.5, seconds - elapsed))
+        time.sleep(min(0.5, actual_sleep - elapsed))
         elapsed += 0.5
 
 def check_timeout():
@@ -348,7 +353,7 @@ def save_final_results():
                     f.write(f"{service} | {key} | {info} | {source_url}\n")
             print(f"\n💾 Saved {len(found_valid_keys)} keys to valid_keys_final_{timestamp}.txt")
 
-# ========== 回复模板 ==========
+# 回复模板
 def build_reply(author, service, key, info, source_url, source_type, balance=None, is_fallback=False):
     masked = key[:12] + "..." + key[-8:] if len(key) > 24 else key
     balance_text = f" (Balance: {balance})" if balance is not None and balance > 0 else ""
@@ -356,7 +361,6 @@ def build_reply(author, service, key, info, source_url, source_type, balance=Non
     install_note = ""
     if is_fallback:
         install_note = f"""
-
 ---
 📌 **To receive notifications directly in your repository, install this bot:**
 https://github.com/apps/llmapicheckbot2
@@ -381,7 +385,7 @@ https://github.com/apps/llmapicheckbot2
 ---
 {BOT_SIGNATURE}{install_note}"""
 
-# ========== 获取完整内容函数（带缓存） ==========
+# 获取完整内容函数
 def get_full_file_content(source_url):
     cache_key = source_url.split("/blob/")[0] + source_url.split("/blob/")[1] if "/blob/" in source_url else source_url
     
@@ -400,6 +404,27 @@ def get_full_file_content(source_url):
             return content
     except Exception as e:
         print(f"    ⚠️ Failed to fetch file: {e}")
+    return None
+
+def get_full_env_content(source_url):
+    """专门获取 .env 文件内容"""
+    cache_key = source_url
+    
+    cached = get_cached(env_content_cache, cache_key)
+    if cached is not None:
+        return cached
+    
+    raw_url = source_url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
+    try:
+        headers = {"User-Agent": random_ua()}
+        resp = requests.get(raw_url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            content = resp.text
+            set_cached(env_content_cache, cache_key, content)
+            print(f"    📄 Fetched .env file: {source_url[:80]}...")
+            return content
+    except Exception as e:
+        print(f"    ⚠️ Failed to fetch .env file: {e}")
     return None
 
 def get_full_issue_content(g, source_url):
@@ -501,11 +526,30 @@ def get_full_commit_content(g, source_url):
         print(f"    ⚠️ Failed to fetch commit: {e}")
         return None
 
-# ========== 在原仓库回复 Issue 或 PR ==========
+# 去重函数
+def is_duplicate(key, source_url):
+    with processed_lock:
+        if key in processed_keys:
+            print(f"    ⏭️ Duplicate key (already processed globally): {key[:20]}...")
+            return True
+        if source_url in processed_sources:
+            print(f"    ⏭️ Duplicate source (already processed): {source_url[:60]}...")
+            return True
+        combo = f"{key}|{source_url}"
+        if combo in processed_key_source:
+            print(f"    ⏭️ Duplicate key-source combo")
+            return True
+    return False
+
+def mark_processed(key, source_url):
+    with processed_lock:
+        processed_keys.add(key)
+        processed_sources.add(source_url)
+        processed_key_source.add(f"{key}|{source_url}")
+
+# 回复函数
 def reply_to_original_issue_or_pr(g, source_url, author, service, key, info, balance):
-    """在原仓库的 Issue 或 PR 评论区回复"""
     try:
-        # 判断是 Issue 还是 PR
         if "/issues/" in source_url:
             parts = source_url.replace("https://github.com/", "").split("/issues/")
             is_pr = False
@@ -522,7 +566,6 @@ def reply_to_original_issue_or_pr(g, source_url, author, service, key, info, bal
         item_num = int(parts[1])
         repo = g.get_repo(repo_path)
         
-        # 获取 Issue 或 PR
         if is_pr:
             item = repo.get_pull(number=item_num)
             comment_func = item.create_issue_comment
@@ -532,7 +575,6 @@ def reply_to_original_issue_or_pr(g, source_url, author, service, key, info, bal
             comment_func = item.create_comment
             item_type = "Issue"
         
-        # 检查是否已经回复过
         bot_login = g.get_user().login
         if is_pr:
             comments = item.get_issue_comments()
@@ -544,7 +586,6 @@ def reply_to_original_issue_or_pr(g, source_url, author, service, key, info, bal
                 print(f"    ⏭️ Already replied to {item_type} #{item_num} in {repo_path}")
                 return True
         
-        # 发送回复
         message = build_reply(author, service, key, info, source_url, item_type.lower(), balance, is_fallback=False)
         comment_func(message)
         print(f"    📝 Replied to {item_type} #{item_num} in {repo_path}")
@@ -554,7 +595,6 @@ def reply_to_original_issue_or_pr(g, source_url, author, service, key, info, bal
         print(f"    ❌ Failed to reply: {e}")
         return False
 
-# ========== 在原仓库为代码文件创建 Issue ==========
 def create_issue_in_original_repo(g, source_url, author, service, key, info, balance):
     if "/blob/" not in source_url:
         return False
@@ -606,7 +646,6 @@ def create_issue_in_original_repo(g, source_url, author, service, key, info, bal
         print(f"    ❌ Failed to create issue in original repo: {e}")
         return False
 
-# ========== 在本仓库创建 Issue ==========
 def create_issue_in_my_repo(g, key, service, info, source_url, source_type, author, balance, is_fallback=False):
     message = build_reply(author, service, key, info, source_url, source_type, balance, is_fallback=is_fallback)
 
@@ -680,13 +719,12 @@ def create_issue_in_my_repo(g, key, service, info, source_url, source_type, auth
     except Exception as e:
         print(f"    ❌ Failed to create issue in my repo: {e}")
 
-# ========== 处理泄露 ==========
 def handle_leak(g, key, service, info, source_url, source_type, author, balance):
-    with processed_lock:
-        if source_url in processed_sources:
-            print(f"    ⏭️ Already processed this source, skipping")
-            return
-        processed_sources.add(source_url)
+    if is_duplicate(key, source_url):
+        print(f"    ⏭️ Skipping duplicate in handle_leak")
+        return
+    
+    mark_processed(key, source_url)
     
     if "/issues/" in source_url or "/pull/" in source_url:
         original_success = reply_to_original_issue_or_pr(g, source_url, author, service, key, info, balance)
@@ -704,7 +742,6 @@ def handle_leak(g, key, service, info, source_url, source_type, author, balance)
         create_issue_in_my_repo(g, key, service, info, source_url, source_type, author, balance, is_fallback=False)
         print(f"    ⚠️ Unknown source type, only created issue in fallback repo")
 
-# ========== 验证批次 ==========
 def verify_batch(worker_id, batch, g):
     if not batch:
         return
@@ -787,6 +824,11 @@ def check_pending_timeout(worker_id, g):
     return False
 
 def add_key_to_pending(worker_id, key, service, source_url, source_type, author, g):
+    if is_duplicate(key, source_url):
+        return
+    
+    mark_processed(key, source_url)
+    
     if worker_id not in batch_locks:
         batch_locks[worker_id] = Lock()
     with batch_locks[worker_id]:
@@ -809,7 +851,6 @@ def add_key_to_pending(worker_id, key, service, source_url, source_type, author,
             executor.submit(verify_batch, worker_id, batch, g)
             executor.shutdown(wait=False)
 
-# ========== 提取和队列 ==========
 def extract_and_queue(text, source_url, source_type, worker_id, author, g):
     full_text = text
     
@@ -818,39 +859,34 @@ def extract_and_queue(text, source_url, source_type, worker_id, author, g):
         if file_content:
             full_text = file_content
             print(f"    📄 Using full file content for code (all keys from this file)")
-        else:
-            full_text = text
+    
+    elif source_type == "env" and "/blob/" in source_url:
+        env_content = get_full_env_content(source_url)
+        if env_content:
+            full_text = env_content
+            print(f"    📄 Using full .env file content (all keys from this file)")
     
     elif source_type == "issue" and "/issues/" in source_url:
         issue_content = get_full_issue_content(g, source_url)
         if issue_content:
             full_text = issue_content
             print(f"    📄 Using full issue content (title + body + comments)")
-        else:
-            full_text = text
     
     elif "/pull/" in source_url:
         pr_content = get_full_pr_content(g, source_url)
         if pr_content:
             full_text = pr_content
             print(f"    📄 Using full PR content (description + comments + diff)")
-        else:
-            full_text = text
     
     elif source_type == "commit" and "/commit/" in source_url:
         commit_content = get_full_commit_content(g, source_url)
         if commit_content:
             full_text = commit_content
             print(f"    📄 Using full commit diff")
-        else:
-            full_text = text
     
     for service, pattern in KEY_PATTERNS.items():
         for match in pattern.finditer(full_text):
             key = match.group(0)
-            with valid_lock:
-                if any(key == k for k, _, _, _, _, _, _ in found_valid_keys):
-                    continue
             print(f"  🔑 Found {service} key in {source_type}: {source_url[:80]}...")
             add_key_to_pending(worker_id, key, service, source_url, source_type, author, g)
     
@@ -974,7 +1010,7 @@ def search_issues_worker(worker_id, start_page, g):
             safe_sleep(5)
             continue
 
-    safe_print(f"[Worker-{worker_id}] ISSUE scan finished, processed {items_processed} items")
+    safe_print(f("[Worker-{worker_id}] ISSUE scan finished, processed {items_processed} items")
 
 def search_commits_worker(worker_id, start_page, g):
     safe_print(f"\n[Worker-{worker_id}] 🚀 Starting COMMIT scan from page {start_page} (infinite)")
@@ -1035,16 +1071,78 @@ def search_commits_worker(worker_id, start_page, g):
 
     safe_print(f"[Worker-{worker_id}] COMMIT scan finished, processed {items_processed} items")
 
+# ========== .env 专用搜索线程 ==========
+def search_env_worker(worker_id, start_page, g):
+    safe_print(f"\n[Worker-{worker_id}] 🚀 Starting ENV file scan (page {start_page})")
+    page = start_page
+    items_processed = 0
+    consecutive_empty = 0
+
+    while not stop_event.is_set():
+        check_timeout()
+        heartbeat()
+
+        url = f"{GITHUB_API}/search/code?q={urllib.parse.quote(ENV_QUERY)}&sort=indexed&order=desc&per_page={PER_PAGE}&page={page}"
+        try:
+            code, data = _http_request(url, headers=_gh_headers(), timeout=REQUEST_TIMEOUT)
+
+            if code == 403:
+                safe_print(f"[Worker-{worker_id}] ENV page {page}: HTTP 403, waiting 60s...")
+                safe_sleep(60)
+                continue
+
+            if code != 200:
+                safe_print(f"[Worker-{worker_id}] ENV page {page}: HTTP {code}, continuing")
+                page += 1
+                safe_sleep(2)
+                continue
+
+            items = data.get("items", []) if isinstance(data, dict) else []
+
+            if not items:
+                consecutive_empty += 1
+                if consecutive_empty >= 3:
+                    safe_print(f"[Worker-{worker_id}] ENV: No more results after {page} pages, stopping")
+                    break
+                page += 1
+                safe_sleep(1)
+                continue
+
+            consecutive_empty = 0
+
+            safe_print(f"[Worker-{worker_id}] 📄 ENV page {page}: {len(items)} items (total: {items_processed + len(items)})")
+
+            for item in items:
+                if stop_event.is_set():
+                    break
+                html_url = item.get("html_url", "")
+                author = item.get("repository", {}).get("owner", {}).get("login", "unknown")
+                
+                extract_and_queue("", html_url, "env", worker_id, author, g)
+                items_processed += 1
+
+            page += 1
+            safe_sleep(0.5)
+        except Exception as e:
+            safe_print(f"[Worker-{worker_id}] ENV error: {e}")
+            page += 1
+            safe_sleep(5)
+            continue
+
+    safe_print(f"[Worker-{worker_id}] ENV scan finished, processed {items_processed} files")
+
 def main():
     print("=" * 70)
-    print("🤖 API Key Leak Scanner - Full Content Extraction with Cache Management")
+    print("🤖 API Key Leak Scanner - Full Content Extraction with Enhanced Deduplication")
     print(f"📁 Fallback repo: {REPO_NAME}")
     print(f"⏱️  Max runtime: {MAX_RUNTIME_SECONDS}s (29.5 minutes)")
     print(f"📦 Batch size: {BATCH_SIZE} keys OR {BATCH_TIMEOUT}s timeout")
     print(f"💾 Cache: max {MAX_CACHE_SIZE} items, TTL {MAX_CACHE_AGE}s")
-    print("📊 Scanning: CODE + ISSUES + COMMITS (infinite pages)")
+    print(f"⏲️  Max backoff: {MAX_BACKOFF}s")
+    print("📊 Scanning: CODE + ISSUES + COMMITS + ENV (infinite pages)")
     print("📊 Feature: Full content extraction for all sources (no key left behind)")
     print("📊 Notification: Issues/PRs get direct replies; Code files get issues; Commits logged only")
+    print("📊 Deduplication: Key + Source URL + Combo")
     print("=" * 70)
 
     g = get_github_client()
@@ -1060,6 +1158,7 @@ def main():
             executor.submit(search_issues_worker, 2, 1, g),
             executor.submit(search_commits_worker, 3, 1, g),
             executor.submit(search_issues_worker, 4, 6, g),
+            executor.submit(search_env_worker, 5, 1, g),
         ]
         for future in as_completed(futures):
             try:
