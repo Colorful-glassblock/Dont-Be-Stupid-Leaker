@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-API Key Leak Scanner - Full Content Extraction with Cache Management
+API Key Leak Scanner - Full Content Extraction with Deep Repo Scan
 - Fetches complete content for all source types (Code/Issues/PRs/Commits/Env files)
+- When a key is found, triggers deep scan of the entire repository
 - Creates issues without labels if label creation fails
 - Random browser User-Agent for all HTTP requests
 - Auto-verify on batch size OR 60s timeout
@@ -41,6 +42,7 @@ VERIFY_WORKERS = 30
 BATCH_SIZE = 30
 BATCH_TIMEOUT = 60
 MAX_BACKOFF = 60
+DEEP_SCAN_MAX_FILES = 200      # 深度扫描最多文件数
 
 # 缓存配置
 MAX_CACHE_SIZE = 200
@@ -82,6 +84,10 @@ processed_keys: set = set()
 processed_sources: set = set()
 processed_key_source: set = set()
 processed_lock = Lock()
+
+# 已深度扫描的仓库
+scanned_repos: set = set()
+scanned_repos_lock = Lock()
 
 # 带时间戳的缓存
 file_content_cache: Dict[str, Tuple[str, float]] = {}
@@ -526,6 +532,71 @@ def get_full_commit_content(g, source_url):
         print(f"    Failed to fetch commit: {e}")
         return None
 
+# 深度扫描整个仓库
+def deep_scan_repository(g, repo_full_name, state, processed):
+    """深度扫描整个仓库，查找所有 Key"""
+    with scanned_repos_lock:
+        if repo_full_name in scanned_repos:
+            return 0
+        scanned_repos.add(repo_full_name)
+    
+    safe_print(f"\n🔍 Deep scanning repository: {repo_full_name}")
+    
+    try:
+        repo = g.get_repo(repo_full_name)
+    except Exception as e:
+        safe_print(f"  ❌ Cannot access repo: {e}")
+        return 0
+    
+    found_count = 0
+    branch = repo.default_branch
+    
+    try:
+        # 获取仓库文件树
+        commit = repo.get_commit(sha=branch)
+        tree = commit.get_tree(recursive=True)
+        
+        files_scanned = 0
+        for item in tree.tree:
+            if files_scanned >= DEEP_SCAN_MAX_FILES:
+                safe_print(f"  ⏸️ Reached max files ({DEEP_SCAN_MAX_FILES}), stopping deep scan")
+                break
+            
+            if item.type != "blob":
+                continue
+            
+            file_path = item.path
+            # 只扫描可能的配置文件
+            if not any(ext in file_path.lower() for ext in ['.env', '.json', '.yaml', '.yml', '.toml', '.txt', '.md', '.cfg', '.conf', 'config', '.ini', '.properties']):
+                continue
+            
+            files_scanned += 1
+            safe_print(f"    📄 Scanning: {file_path}")
+            
+            try:
+                raw_url = f"https://raw.githubusercontent.com/{repo_full_name}/{branch}/{file_path}"
+                headers = {"User-Agent": random_ua()}
+                resp = requests.get(raw_url, headers=headers, timeout=10)
+                if resp.status_code == 200:
+                    content = resp.text
+                    for service, pattern in KEY_PATTERNS.items():
+                        for match in pattern.finditer(content):
+                            key = match.group(0)
+                            with valid_lock:
+                                if any(key == k for k, _, _, _, _, _, _ in found_valid_keys):
+                                    continue
+                            safe_print(f"      🔑 Found {service} key in deep scan: {file_path}")
+                            add_key_to_pending(1, key, service, item.url, "deep_scan", repo.owner.login, g)
+                            found_count += 1
+            except Exception as e:
+                safe_print(f"      ⚠️ Error fetching {file_path}: {e}")
+                
+    except Exception as e:
+        safe_print(f"  ❌ Deep scan failed: {e}")
+    
+    safe_print(f"  ✅ Deep scan completed: found {found_count} new keys")
+    return found_count
+
 # 去重函数
 def is_duplicate(key, source_url):
     with processed_lock:
@@ -725,6 +796,17 @@ def handle_leak(g, key, service, info, source_url, source_type, author, balance)
         return
     
     mark_processed(key, source_url)
+    
+    # 触发深度扫描（仅当不是深度扫描本身）
+    if source_type != "deep_scan":
+        repo_name = "/".join(source_url.split("/")[3:5]) if "github.com" in source_url else None
+        if repo_name:
+            with scanned_repos_lock:
+                if repo_name not in scanned_repos:
+                    # 异步触发深度扫描
+                    executor = ThreadPoolExecutor(max_workers=1)
+                    executor.submit(deep_scan_repository, g, repo_name, state, processed)
+                    executor.shutdown(wait=False)
     
     if "/issues/" in source_url or "/pull/" in source_url:
         original_success = reply_to_original_issue_or_pr(g, source_url, author, service, key, info, balance)
@@ -1132,13 +1214,15 @@ def search_env_worker(worker_id, start_page, g):
 
 def main():
     print("=" * 70)
-    print("API Key Leak Scanner - Full Content Extraction")
+    print("API Key Leak Scanner - Full Content Extraction with Deep Repo Scan")
     print(f"Fallback repo: {REPO_NAME}")
     print(f"Max runtime: {MAX_RUNTIME_SECONDS}s (29.5 minutes)")
     print(f"Batch size: {BATCH_SIZE} keys OR {BATCH_TIMEOUT}s timeout")
     print(f"Cache: max {MAX_CACHE_SIZE} items, TTL {MAX_CACHE_AGE}s")
     print(f"Max backoff: {MAX_BACKOFF}s")
+    print(f"Deep scan max files: {DEEP_SCAN_MAX_FILES}")
     print("Scanning: CODE + ISSUES + COMMITS + ENV (infinite pages)")
+    print("Feature: Deep repository scan when key is found")
     print("=" * 70)
 
     g = get_github_client()
