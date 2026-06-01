@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """
-API Key Leak Scanner - Dual Notification Version
-- For Issues and Code files: Notify both original repo AND fallback repo
-- For PRs and Commits: Only notify fallback repo (no original notification)
-- OpenRouter support with credits display
-- 29.5 minute timeout, infinite pagination
-- Fallback notification includes bot installation link
+API Key Leak Scanner - Full Version with Complete Content Extraction
+- Fetches complete content for all source types (Code/Issues/PRs/Commits)
+- Caches file content to avoid re-downloads
 """
 
 import os
@@ -46,7 +43,7 @@ BOT_SIGNATURE = f"*This message was sent by {BOT_NAME} - Repository: {REPO_NAME}
 
 GITHUB_API = "https://api.github.com"
 
-# 搜索条件 (最多5个OR，满足限制)
+# 搜索条件
 ISSUE_QUERY = '"your key leak" OR "sk-" OR "sk-proj-" OR "xai-" OR "AIza" OR "sk-ant-api"'
 COMMIT_QUERY = 'sk- OR sk-proj- OR xai- OR AIza OR sk-ant-api'
 CODE_QUERY = 'sk- OR sk-proj- OR xai- OR AIza OR sk-ant-api'
@@ -64,6 +61,13 @@ pending_count: Dict[int, int] = defaultdict(int)
 
 processed_sources: set = set()
 processed_lock = Lock()
+
+# 缓存
+file_content_cache: Dict[str, str] = {}
+issue_content_cache: Dict[str, str] = {}
+pr_content_cache: Dict[str, str] = {}
+commit_content_cache: Dict[str, str] = {}
+cache_lock = Lock()
 
 # ========== Key 正则 ==========
 KEY_PATTERNS = {
@@ -259,7 +263,7 @@ def save_final_results():
                     f.write(f"{service} | {key} | {info} | {source_url}\n")
             print(f"\n💾 Saved {len(found_valid_keys)} keys to valid_keys_final_{timestamp}.txt")
 
-# ========== 回复模板（带 fallback 安装链接） ==========
+# ========== 回复模板 ==========
 def build_reply(author, service, key, info, source_url, source_type, balance=None, is_fallback=False):
     masked = key[:12] + "..." + key[-8:] if len(key) > 24 else key
     balance_text = f" (Balance: {balance})" if balance is not None and balance > 0 else ""
@@ -292,9 +296,139 @@ https://github.com/apps/llmapicheckbot2
 ---
 {BOT_SIGNATURE}{install_note}"""
 
+# ========== 获取完整内容函数 ==========
+def get_full_file_content(source_url):
+    """获取完整文件内容"""
+    cache_key = source_url.split("/blob/")[0] + source_url.split("/blob/")[1] if "/blob/" in source_url else source_url
+    
+    with cache_lock:
+        if cache_key in file_content_cache:
+            return file_content_cache[cache_key]
+    
+    raw_url = source_url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
+    try:
+        resp = requests.get(raw_url, timeout=10)
+        if resp.status_code == 200:
+            content = resp.text
+            with cache_lock:
+                file_content_cache[cache_key] = content
+            print(f"    📄 Fetched full file: {source_url[:80]}...")
+            return content
+    except Exception as e:
+        print(f"    ⚠️ Failed to fetch file: {e}")
+    return None
+
+def get_full_issue_content(g, source_url):
+    """获取完整 Issue 内容（标题 + 正文 + 所有评论）"""
+    with cache_lock:
+        if source_url in issue_content_cache:
+            return issue_content_cache[source_url]
+    
+    try:
+        parts = source_url.replace("https://github.com/", "").split("/issues/")
+        if len(parts) != 2:
+            return None
+        repo_path = parts[0]
+        issue_num = int(parts[1])
+        
+        repo = g.get_repo(repo_path)
+        issue = repo.get_issue(number=issue_num)
+        
+        content = f"# {issue.title}\n\n{issue.body or ''}\n\n"
+        
+        # 获取评论
+        comments = issue.get_comments()
+        for i, comment in enumerate(comments):
+            content += f"\n## Comment by {comment.user.login}\n{comment.body or ''}\n"
+        
+        with cache_lock:
+            issue_content_cache[source_url] = content
+        print(f"    📄 Fetched full issue #{issue_num} with {comments.totalCount} comments")
+        return content
+    except Exception as e:
+        print(f"    ⚠️ Failed to fetch issue: {e}")
+        return None
+
+def get_full_pr_content(g, source_url):
+    """获取完整 PR 内容（描述 + 所有评论 + 文件 diff）"""
+    with cache_lock:
+        if source_url in pr_content_cache:
+            return pr_content_cache[source_url]
+    
+    try:
+        parts = source_url.replace("https://github.com/", "").split("/pull/")
+        if len(parts) != 2:
+            return None
+        repo_path = parts[0]
+        pr_num = int(parts[1])
+        
+        repo = g.get_repo(repo_path)
+        pr = repo.get_pull(number=pr_num)
+        
+        content = f"# {pr.title}\n\n{pr.body or ''}\n\n"
+        
+        # 获取评论
+        comments = pr.get_issue_comments()
+        for comment in comments:
+            content += f"\n## Comment by {comment.user.login}\n{comment.body or ''}\n"
+        
+        # 获取 review comments
+        review_comments = pr.get_review_comments()
+        for rc in review_comments:
+            content += f"\n## Review Comment by {rc.user.login}\n{rc.body or ''}\n"
+        
+        # 获取 diff
+        diff_url = f"https://patch-diff.githubusercontent.com/raw/{repo_path}/pull/{pr_num}.diff"
+        try:
+            resp = requests.get(diff_url, timeout=10)
+            if resp.status_code == 200:
+                content += f"\n## Diff\n{resp.text}\n"
+        except:
+            pass
+        
+        with cache_lock:
+            pr_content_cache[source_url] = content
+        print(f"    📄 Fetched full PR #{pr_num}")
+        return content
+    except Exception as e:
+        print(f"    ⚠️ Failed to fetch PR: {e}")
+        return None
+
+def get_full_commit_content(g, source_url):
+    """获取完整 Commit 内容（消息 + diff）"""
+    with cache_lock:
+        if source_url in commit_content_cache:
+            return commit_content_cache[source_url]
+    
+    try:
+        parts = source_url.replace("https://github.com/", "").split("/commit/")
+        if len(parts) != 2:
+            return None
+        repo_path = parts[0]
+        commit_sha = parts[1]
+        
+        repo = g.get_repo(repo_path)
+        commit = repo.get_commit(sha=commit_sha)
+        
+        content = f"# {commit.commit.message}\n\n"
+        
+        # 获取 diff
+        files = commit.files
+        for f in files:
+            content += f"\n## {f.filename}\n"
+            if f.patch:
+                content += f"{f.patch}\n"
+        
+        with cache_lock:
+            commit_content_cache[source_url] = content
+        print(f"    📄 Fetched full commit {commit_sha[:8]}")
+        return content
+    except Exception as e:
+        print(f"    ⚠️ Failed to fetch commit: {e}")
+        return None
+
 # ========== 在原仓库回复 Issue ==========
 def reply_to_original_issue(g, source_url, author, service, key, info, balance):
-    """仅在原仓库的 Issue 下回复"""
     if "/issues/" not in source_url:
         return False
     try:
@@ -304,7 +438,6 @@ def reply_to_original_issue(g, source_url, author, service, key, info, balance):
         repo = g.get_repo(repo_path)
         issue = repo.get_issue(number=issue_num)
 
-        # 检查是否已回复
         bot_login = g.get_user().login
         for comment in issue.get_comments():
             if comment.user.login == bot_login and "API Key Leak Detected" in comment.body:
@@ -321,7 +454,6 @@ def reply_to_original_issue(g, source_url, author, service, key, info, balance):
 
 # ========== 在原仓库为代码文件创建 Issue ==========
 def create_issue_in_original_repo(g, source_url, author, service, key, info, balance):
-    """对于代码文件，在原仓库创建 Issue"""
     if "/blob/" not in source_url:
         return False
     try:
@@ -330,8 +462,6 @@ def create_issue_in_original_repo(g, source_url, author, service, key, info, bal
         file_path = parts[1]
         repo = g.get_repo(repo_path)
 
-        # 检查是否已存在相同文件的 issue
-        bot_login = g.get_user().login
         existing = repo.get_issues(state="all", labels=["security"])
         for issue in existing:
             if file_path in issue.title or source_url in issue.body:
@@ -348,15 +478,13 @@ def create_issue_in_original_repo(g, source_url, author, service, key, info, bal
         print(f"    ❌ Failed to create issue in original repo: {e}")
         return False
 
-# ========== 在本仓库创建 Issue (fallback + PR/commit) ==========
+# ========== 在本仓库创建 Issue ==========
 def create_issue_in_my_repo(g, key, service, info, source_url, source_type, author, balance, is_fallback=False):
-    """在自己的仓库创建 Issue 记录"""
     message = build_reply(author, service, key, info, source_url, source_type, balance, is_fallback=is_fallback)
 
     try:
         my_repo = g.get_repo(REPO_NAME)
 
-        # 检查是否已存在相同来源的 Issue
         already_exists = False
         existing_issue_num = None
         try:
@@ -415,7 +543,7 @@ def create_issue_in_my_repo(g, key, service, info, source_url, source_type, auth
     except Exception as e:
         print(f"    ❌ Failed to create issue in my repo: {e}")
 
-# ========== 统一处理泄露 ==========
+# ========== 处理泄露 ==========
 def handle_leak(g, key, service, info, source_url, source_type, author, balance):
     with processed_lock:
         if source_url in processed_sources:
@@ -423,24 +551,19 @@ def handle_leak(g, key, service, info, source_url, source_type, author, balance)
             return
         processed_sources.add(source_url)
 
-    # 根据来源类型决定通知策略
     if "/issues/" in source_url:
-        # Issue: 原仓库回复 + 自己的仓库记录
         original_success = reply_to_original_issue(g, source_url, author, service, key, info, balance)
         create_issue_in_my_repo(g, key, service, info, source_url, source_type, author, balance, is_fallback=not original_success)
 
     elif "/blob/" in source_url:
-        # Code file: 原仓库创建 Issue + 自己的仓库记录
         original_success = create_issue_in_original_repo(g, source_url, author, service, key, info, balance)
         create_issue_in_my_repo(g, key, service, info, source_url, source_type, author, balance, is_fallback=not original_success)
 
     elif "/pull/" in source_url or "/commit/" in source_url:
-        # PR 或 Commit: 只在自己的仓库创建 Issue（不在原仓库回复）
         create_issue_in_my_repo(g, key, service, info, source_url, source_type, author, balance, is_fallback=False)
         print(f"    ℹ️ PR/Commit source, only created issue in fallback repo")
 
     else:
-        # 未知类型，只在自己的仓库记录
         create_issue_in_my_repo(g, key, service, info, source_url, source_type, author, balance, is_fallback=False)
         print(f"    ⚠️ Unknown source type, only created issue in fallback repo")
 
@@ -507,9 +630,39 @@ def add_key_to_pending(worker_id, key, service, source_url, source_type, author,
             executor.submit(verify_batch, worker_id, batch, g)
             executor.shutdown(wait=False)
 
+# ========== 提取和队列（带完整内容获取） ==========
 def extract_and_queue(text, source_url, source_type, worker_id, author, g):
+    """提取 Key 并加入队列，自动获取完整内容"""
+    full_text = text
+    
+    # 根据来源类型获取完整内容
+    if "/blob/" in source_url and source_type == "code":
+        file_content = get_full_file_content(source_url)
+        if file_content:
+            full_text = file_content
+            print(f"    📄 Using full file content for code")
+    
+    elif "/issues/" in source_url and source_type == "issue":
+        issue_content = get_full_issue_content(g, source_url)
+        if issue_content:
+            full_text = issue_content
+            print(f"    📄 Using full issue content (body + comments)")
+    
+    elif "/pull/" in source_url:
+        pr_content = get_full_pr_content(g, source_url)
+        if pr_content:
+            full_text = pr_content
+            print(f"    📄 Using full PR content (description + comments + diff)")
+    
+    elif "/commit/" in source_url and source_type == "commit":
+        commit_content = get_full_commit_content(g, source_url)
+        if commit_content:
+            full_text = commit_content
+            print(f"    📄 Using full commit diff")
+    
+    # 从完整内容中提取所有 Key
     for service, pattern in KEY_PATTERNS.items():
-        for match in pattern.finditer(text):
+        for match in pattern.finditer(full_text):
             key = match.group(0)
             with valid_lock:
                 if any(key == k for k, _, _, _, _, _, _ in found_valid_keys):
@@ -561,14 +714,17 @@ def search_code_worker(worker_id, start_page, g):
             for item in items:
                 if stop_event.is_set():
                     break
-                raw_url = item.get("html_url", "").replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
+                html_url = item.get("html_url", "")
                 author = item.get("repository", {}).get("owner", {}).get("login", "unknown")
-                try:
-                    resp = requests.get(raw_url, timeout=10)
-                    if resp.status_code == 200:
-                        extract_and_queue(resp.text, item.get("html_url", ""), "code", worker_id, author, g)
-                except:
-                    pass
+                
+                snippet = ""
+                if "text_matches" in item:
+                    for match in item.get("text_matches", []):
+                        snippet += match.get("fragment", "") + "\n"
+                if not snippet:
+                    snippet = item.get("name", "") + " " + item.get("path", "")
+                
+                extract_and_queue(snippet, html_url, "code", worker_id, author, g)
                 items_processed += 1
 
             page += 1
@@ -723,14 +879,16 @@ def search_commits_worker(worker_id, start_page, g):
 
 def main():
     print("=" * 70)
-    print("🤖 API Key Leak Scanner - Dual Notification Version")
+    print("🤖 API Key Leak Scanner - Full Content Extraction Version")
     print(f"📁 Fallback repo: {REPO_NAME}")
     print(f"⏱️  Max runtime: {MAX_RUNTIME_SECONDS}s (29.5 minutes)")
     print("📊 Scanning: CODE + ISSUES + COMMITS (infinite pages)")
-    print("📊 Notification strategy:")
-    print("   - Issue: reply in original issue + create issue in fallback repo")
-    print("   - Code file: create issue in original repo + create issue in fallback repo")
-    print("   - PR/Commit: create issue only in fallback repo")
+    print("📊 Features:")
+    print("   - Full file content extraction for code")
+    print("   - Full issue content (title + body + comments)")
+    print("   - Full PR content (description + comments + diff)")
+    print("   - Full commit diff extraction")
+    print("   - Dual notification (original + fallback)")
     print("=" * 70)
 
     g = get_github_client()
