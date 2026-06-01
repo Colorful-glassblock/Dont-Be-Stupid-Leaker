@@ -36,7 +36,7 @@ MAX_RUNTIME_SECONDS = 29.5 * 60
 HEARTBEAT_INTERVAL = 60
 REQUEST_TIMEOUT = 15
 PER_PAGE = 30
-SEARCH_WORKERS = 5          # 增加到5个worker
+SEARCH_WORKERS = 5
 VERIFY_WORKERS = 30
 BATCH_SIZE = 30
 BATCH_TIMEOUT = 60
@@ -61,7 +61,7 @@ GITHUB_API = "https://api.github.com"
 ISSUE_QUERY = '"your key leak" OR "sk-" OR "sk-proj-" OR "xai-" OR "AIza" OR "sk-ant-api"'
 COMMIT_QUERY = 'sk- OR sk-proj- OR xai- OR AIza OR sk-ant-api'
 CODE_QUERY = 'sk- OR sk-proj- OR xai- OR AIza OR sk-ant-api'
-ENV_QUERY = 'filename:.env OR filename:.env.example OR filename:.env.local OR filename:.env.production OR filename:.env.staging'
+ENV_QUERY = 'filename:.env OR filename:.env.example OR filename:.env.local OR filename:.env.production OR filename:.env.staging OR filename:.env.dev OR filename:.env.test'
 
 STATE_FILE = "replied_state.json"
 
@@ -139,7 +139,7 @@ def print_cache_stats():
         commit_count = len(commit_content_cache)
         env_count = len(env_content_cache)
         total = file_count + issue_count + pr_count + commit_count + env_count
-        print(f"📊 Cache: files={file_count}, issues={issue_count}, PRs={pr_count}, commits={commit_count}, env={env_count}, total={total}")
+        print(f"Cache: files={file_count}, issues={issue_count}, PRs={pr_count}, commits={commit_count}, env={env_count}, total={total}")
 
 # Key 正则
 KEY_PATTERNS = {
@@ -165,7 +165,7 @@ def _parse_deepseek(code, data):
     if data.get("is_available", False):
         cny = sum(float(i.get("total_balance", 0)) for i in data.get("balance_infos", []) if i.get("currency") == "CNY")
         usd = sum(float(i.get("total_balance", 0)) for i in data.get("balance_infos", []) if i.get("currency") == "USD")
-        info = f"💰 CNY: {cny:.2f}, USD: {usd:.2f}" if cny or usd else "Valid (no balance)"
+        info = f"CNY: {cny:.2f}, USD: {usd:.2f}" if cny or usd else "Valid (no balance)"
         return True, cny + usd * 7.2, info
     return False, 0, "Invalid"
 
@@ -183,7 +183,7 @@ def _parse_openrouter(code, data):
         credits = 0
         if isinstance(data, dict):
             credits = data.get("credits", 0)
-        info = f"💰 Credits: {credits}" if credits > 0 else "Valid (no credits)"
+        info = f"Credits: {credits}" if credits > 0 else "Valid (no credits)"
         return True, float(credits), info
     return False, 0, f"HTTP {code}"
 
@@ -196,18 +196,18 @@ def _parse_xai(code, data):
 
 def _parse_gemini(code, data):
     if code == 200:
-        return True, 0, "✅ Valid"
+        return True, 0, "Valid"
     if code == 403:
-        return True, 0, "⚠️ Valid but restricted (IP/region/billing)"
+        return True, 0, "Valid but restricted (IP/region/billing)"
     if code == 400:
         if isinstance(data, dict) and "API key not valid" in str(data):
-            return False, 0, "❌ Invalid key"
-        return True, 0, "⚠️ Possibly valid (check billing)"
+            return False, 0, "Invalid key"
+        return True, 0, "Possibly valid (check billing)"
     if code == 404:
-        return False, 0, "❌ Invalid (not found)"
+        return False, 0, "Invalid (not found)"
     if code == 429:
-        return True, 0, "⚠️ Rate limited (key may be valid)"
-    return False, 0, f"❌ HTTP {code}"
+        return True, 0, "Rate limited (key may be valid)"
+    return False, 0, f"HTTP {code}"
 
 def _parse_anthropic(code, data):
     if code == 200:
@@ -229,7 +229,7 @@ def _parse_mimo(code, data):
         balance = 0
         if isinstance(data, dict):
             balance = float(data.get("balance", data.get("credit", 0)))
-        info = f"💰 Balance: {balance}" if balance > 0 else "Valid"
+        info = f"Balance: {balance}" if balance > 0 else "Valid"
         return True, balance, info
     return False, 0, f"HTTP {code}"
 
@@ -266,14 +266,14 @@ def get_github_client():
             resp = requests.post(url, headers=headers)
             if resp.status_code == 201:
                 token = resp.json()["token"]
-                print("✅ Using GitHub App authentication")
+                print("Using GitHub App authentication")
         except Exception as e:
-            print(f"⚠️ GitHub App auth failed: {e}")
+            print(f"GitHub App auth failed: {e}")
     if not token and PAT_TOKEN:
         token = PAT_TOKEN
-        print("✅ Using PAT authentication")
+        print("Using PAT authentication")
     if not token:
-        print("❌ No authentication method available")
+        print("No authentication method available")
         return None
     auth = Auth.Token(token)
     return Github(auth=auth, retry=0)
@@ -317,7 +317,7 @@ def safe_sleep(seconds):
 def check_timeout():
     elapsed = time.time() - start_time
     if elapsed >= MAX_RUNTIME_SECONDS:
-        print(f"\n[!] Max runtime reached ({MAX_RUNTIME_SECONDS}s / 29.5 min). Exiting.")
+        print(f"\nMax runtime reached ({MAX_RUNTIME_SECONDS}s / 29.5 min). Exiting.")
         save_final_results()
         sys.exit(0)
     return elapsed
@@ -328,12 +328,12 @@ def heartbeat():
     if now - last_heartbeat >= HEARTBEAT_INTERVAL:
         elapsed = now - start_time
         remaining = MAX_RUNTIME_SECONDS - elapsed
-        print(f"[❤️] Alive: {elapsed:.0f}s / {MAX_RUNTIME_SECONDS}s (remaining: {remaining:.0f}s)")
+        print(f"Alive: {elapsed:.0f}s / {MAX_RUNTIME_SECONDS}s (remaining: {remaining:.0f}s)")
         print_cache_stats()
         last_heartbeat = now
 
 def signal_handler(sig, frame):
-    print("\n\n⚠️ Interrupted, saving results...")
+    print("\nInterrupted, saving results...")
     stop_event.set()
     safe_sleep(2)
     save_final_results()
@@ -351,7 +351,7 @@ def save_final_results():
                 f.write(f"# Total valid keys: {len(found_valid_keys)}\n\n")
                 for key, service, balance, info, source_url, source_type, _ in found_valid_keys:
                     f.write(f"{service} | {key} | {info} | {source_url}\n")
-            print(f"\n💾 Saved {len(found_valid_keys)} keys to valid_keys_final_{timestamp}.txt")
+            print(f"\nSaved {len(found_valid_keys)} keys to valid_keys_final_{timestamp}.txt")
 
 # 回复模板
 def build_reply(author, service, key, info, source_url, source_type, balance=None, is_fallback=False):
@@ -361,26 +361,27 @@ def build_reply(author, service, key, info, source_url, source_type, balance=Non
     install_note = ""
     if is_fallback:
         install_note = f"""
+
 ---
-📌 **To receive notifications directly in your repository, install this bot:**
+To receive notifications directly in your repository, install this bot:
 https://github.com/apps/llmapicheckbot2
 """
     
-    return f"""🔴 **API Key Leak Detected!**
+    return f"""API Key Leak Detected!
 
 @{author} Your API key has been exposed in this {source_type}{balance_text}.
 
-**Service:** `{service}`
-**Key preview:** `{masked}`
-**Status:** {info}
+Service: {service}
+Key preview: {masked}
+Status: {info}
 
-⚠️ **Immediate Actions Required:**
+Immediate Actions Required:
 1. Revoke this key immediately from your {service} dashboard
 2. Generate a new key
 3. Remove the exposed key from the {source_type}
 4. Rotate any other secrets that may be compromised
 
-📍 **Source:** {source_url}
+Source: {source_url}
 
 ---
 {BOT_SIGNATURE}{install_note}"""
@@ -400,14 +401,13 @@ def get_full_file_content(source_url):
         if resp.status_code == 200:
             content = resp.text
             set_cached(file_content_cache, cache_key, content)
-            print(f"    📄 Fetched full file: {source_url[:80]}...")
+            print(f"    Fetched full file: {source_url[:80]}...")
             return content
     except Exception as e:
-        print(f"    ⚠️ Failed to fetch file: {e}")
+        print(f"    Failed to fetch file: {e}")
     return None
 
 def get_full_env_content(source_url):
-    """专门获取 .env 文件内容"""
     cache_key = source_url
     
     cached = get_cached(env_content_cache, cache_key)
@@ -421,10 +421,10 @@ def get_full_env_content(source_url):
         if resp.status_code == 200:
             content = resp.text
             set_cached(env_content_cache, cache_key, content)
-            print(f"    📄 Fetched .env file: {source_url[:80]}...")
+            print(f"    Fetched .env file: {source_url[:80]}...")
             return content
     except Exception as e:
-        print(f"    ⚠️ Failed to fetch .env file: {e}")
+        print(f"    Failed to fetch .env file: {e}")
     return None
 
 def get_full_issue_content(g, source_url):
@@ -449,10 +449,10 @@ def get_full_issue_content(g, source_url):
             content += f"\n## Comment by {comment.user.login}\n{comment.body or ''}\n"
         
         set_cached(issue_content_cache, source_url, content)
-        print(f"    📄 Fetched full issue #{issue_num} with {comments.totalCount} comments")
+        print(f"    Fetched full issue #{issue_num} with {comments.totalCount} comments")
         return content
     except Exception as e:
-        print(f"    ⚠️ Failed to fetch issue: {e}")
+        print(f"    Failed to fetch issue: {e}")
         return None
 
 def get_full_pr_content(g, source_url):
@@ -490,10 +490,10 @@ def get_full_pr_content(g, source_url):
             pass
         
         set_cached(pr_content_cache, source_url, content)
-        print(f"    📄 Fetched full PR #{pr_num}")
+        print(f"    Fetched full PR #{pr_num}")
         return content
     except Exception as e:
-        print(f"    ⚠️ Failed to fetch PR: {e}")
+        print(f"    Failed to fetch PR: {e}")
         return None
 
 def get_full_commit_content(g, source_url):
@@ -520,24 +520,24 @@ def get_full_commit_content(g, source_url):
                 content += f"{f.patch}\n"
         
         set_cached(commit_content_cache, source_url, content)
-        print(f"    📄 Fetched full commit {commit_sha[:8]}")
+        print(f"    Fetched full commit {commit_sha[:8]}")
         return content
     except Exception as e:
-        print(f"    ⚠️ Failed to fetch commit: {e}")
+        print(f"    Failed to fetch commit: {e}")
         return None
 
 # 去重函数
 def is_duplicate(key, source_url):
     with processed_lock:
         if key in processed_keys:
-            print(f"    ⏭️ Duplicate key (already processed globally): {key[:20]}...")
+            print(f"    Duplicate key (already processed): {key[:20]}...")
             return True
         if source_url in processed_sources:
-            print(f"    ⏭️ Duplicate source (already processed): {source_url[:60]}...")
+            print(f"    Duplicate source (already processed): {source_url[:60]}...")
             return True
         combo = f"{key}|{source_url}"
         if combo in processed_key_source:
-            print(f"    ⏭️ Duplicate key-source combo")
+            print(f"    Duplicate key-source combo")
             return True
     return False
 
@@ -583,16 +583,16 @@ def reply_to_original_issue_or_pr(g, source_url, author, service, key, info, bal
         
         for comment in comments:
             if comment.user.login == bot_login and "API Key Leak Detected" in comment.body:
-                print(f"    ⏭️ Already replied to {item_type} #{item_num} in {repo_path}")
+                print(f"    Already replied to {item_type} #{item_num} in {repo_path}")
                 return True
         
         message = build_reply(author, service, key, info, source_url, item_type.lower(), balance, is_fallback=False)
         comment_func(message)
-        print(f"    📝 Replied to {item_type} #{item_num} in {repo_path}")
+        print(f"    Replied to {item_type} #{item_num} in {repo_path}")
         return True
         
     except Exception as e:
-        print(f"    ❌ Failed to reply: {e}")
+        print(f"    Failed to reply: {e}")
         return False
 
 def create_issue_in_original_repo(g, source_url, author, service, key, info, balance):
@@ -613,37 +613,37 @@ def create_issue_in_original_repo(g, source_url, author, service, key, info, bal
                 for issue in issues:
                     if file_path in issue.title or source_url in issue.body:
                         already_exists = True
-                        print(f"    ⏭️ Issue already exists for {file_path} in {repo_path}")
+                        print(f"    Issue already exists for {file_path} in {repo_path}")
                         break
         except Exception as e:
-            print(f"    ⚠️ Could not check existing issues: {e}")
+            print(f"    Could not check existing issues: {e}")
 
         if already_exists:
             return True
 
         message = build_reply(author, service, key, info, source_url, "code file", balance, is_fallback=False)
-        issue_title = f"🔴 API Key Leak Detected in {file_path}"
-        issue_body = message + f"\n\n**File:** `{file_path}`"
+        issue_title = f"API Key Leak Detected in {file_path}"
+        issue_body = message + f"\n\nFile: {file_path}"
         
         try:
             new_issue = repo.create_issue(title=issue_title, body=issue_body, labels=["security"])
-            print(f"    📝 Created issue in {repo_path} for file {file_path} (with labels)")
+            print(f"    Created issue in {repo_path} for file {file_path} (with labels)")
             return True
         except Exception as e:
             if "labels" in str(e).lower() or "permission" in str(e).lower():
-                print(f"    ⚠️ Cannot create labels in {repo_path}, retrying without labels...")
+                print(f"    Cannot create labels in {repo_path}, retrying without labels...")
                 try:
                     new_issue = repo.create_issue(title=issue_title, body=issue_body)
-                    print(f"    📝 Created issue in {repo_path} for file {file_path} (without labels)")
+                    print(f"    Created issue in {repo_path} for file {file_path} (without labels)")
                     return True
                 except Exception as e2:
-                    print(f"    ❌ Failed to create issue even without labels: {e2}")
+                    print(f"    Failed to create issue even without labels: {e2}")
                     return False
             else:
-                print(f"    ❌ Failed to create issue: {e}")
+                print(f"    Failed to create issue: {e}")
                 return False
     except Exception as e:
-        print(f"    ❌ Failed to create issue in original repo: {e}")
+        print(f"    Failed to create issue in original repo: {e}")
         return False
 
 def create_issue_in_my_repo(g, key, service, info, source_url, source_type, author, balance, is_fallback=False):
@@ -663,10 +663,10 @@ def create_issue_in_my_repo(g, key, service, info, source_url, source_type, auth
                         existing_issue_num = issue.number
                         break
         except Exception as e:
-            print(f"    ⚠️ Failed to check existing issues: {e}")
+            print(f"    Failed to check existing issues: {e}")
 
         if already_exists:
-            print(f"    ⏭️ Issue #{existing_issue_num} already exists for this source, skipping")
+            print(f"    Issue #{existing_issue_num} already exists for this source, skipping")
             return
 
         short_url = source_url.replace("https://github.com/", "")
@@ -683,18 +683,18 @@ def create_issue_in_my_repo(g, key, service, info, source_url, source_type, auth
             display_type = source_type
 
         fallback_note = " (fallback because original notification failed)" if is_fallback else ""
-        issue_title = f"🔴 {service} Key Leak in {display_type}: {short_url}"
+        issue_title = f"{service} Key Leak in {display_type}: {short_url}"
         issue_body = f"""## API Key Leak Detected{fallback_note}
 
 | Field | Value |
 |-------|-------|
-| **Source Type** | {display_type} |
-| **Source URL** | {source_url} |
-| **Service** | `{service}` |
-| **Key Preview** | `{key[:20]}...` |
-| **Status** | {info} |
-| **Author** | @{author} |
-| **Balance** | {balance if balance else 'N/A'} |
+| Source Type | {display_type} |
+| Source URL | {source_url} |
+| Service | {service} |
+| Key Preview | {key[:20]}... |
+| Status | {info} |
+| Author | @{author} |
+| Balance | {balance if balance else 'N/A'} |
 
 ---
 
@@ -704,24 +704,24 @@ def create_issue_in_my_repo(g, key, service, info, source_url, source_type, auth
 
 ---
 
-*Auto-generated by {BOT_NAME}*
+Auto-generated by {BOT_NAME}
 """
         try:
             new_issue = my_repo.create_issue(title=issue_title, body=issue_body, labels=["security", "leak"])
-            print(f"    📝 Created issue #{new_issue.number} in {REPO_NAME} (with labels)")
+            print(f"    Created issue #{new_issue.number} in {REPO_NAME} (with labels)")
         except Exception as e:
             if "labels" in str(e).lower() or "permission" in str(e).lower():
-                print(f"    ⚠️ Cannot create labels in {REPO_NAME}, retrying without labels...")
+                print(f"    Cannot create labels in {REPO_NAME}, retrying without labels...")
                 new_issue = my_repo.create_issue(title=issue_title, body=issue_body)
-                print(f"    📝 Created issue #{new_issue.number} in {REPO_NAME} (without labels)")
+                print(f"    Created issue #{new_issue.number} in {REPO_NAME} (without labels)")
             else:
                 raise
     except Exception as e:
-        print(f"    ❌ Failed to create issue in my repo: {e}")
+        print(f"    Failed to create issue in my repo: {e}")
 
 def handle_leak(g, key, service, info, source_url, source_type, author, balance):
     if is_duplicate(key, source_url):
-        print(f"    ⏭️ Skipping duplicate in handle_leak")
+        print(f"    Skipping duplicate in handle_leak")
         return
     
     mark_processed(key, source_url)
@@ -736,11 +736,11 @@ def handle_leak(g, key, service, info, source_url, source_type, author, balance)
     
     elif "/commit/" in source_url:
         create_issue_in_my_repo(g, key, service, info, source_url, source_type, author, balance, is_fallback=False)
-        print(f"    ℹ️ Commit source, only created issue in fallback repo")
+        print(f"    Commit source, only created issue in fallback repo")
     
     else:
         create_issue_in_my_repo(g, key, service, info, source_url, source_type, author, balance, is_fallback=False)
-        print(f"    ⚠️ Unknown source type, only created issue in fallback repo")
+        print(f"    Unknown source type, only created issue in fallback repo")
 
 def verify_batch(worker_id, batch, g):
     if not batch:
@@ -748,9 +748,9 @@ def verify_batch(worker_id, batch, g):
     
     is_timeout_trigger = len(batch) < BATCH_SIZE
     if is_timeout_trigger:
-        safe_print(f"\n[Worker-{worker_id}] ⏰ Verifying timeout batch: {len(batch)} keys (triggered by {BATCH_TIMEOUT}s timeout)")
+        safe_print(f"\n[Worker-{worker_id}] Verifying timeout batch: {len(batch)} keys (triggered by {BATCH_TIMEOUT}s timeout)")
     else:
-        safe_print(f"\n[Worker-{worker_id}] 🔍 Verifying full batch: {len(batch)} keys")
+        safe_print(f"\n[Worker-{worker_id}] Verifying full batch: {len(batch)} keys")
 
     def verify_one(key_info):
         key, service, source_url, source_type, author = key_info
@@ -782,8 +782,8 @@ def verify_batch(worker_id, batch, g):
                 key, service, valid, balance, info, source_url, source_type, author = future.result(timeout=15)
                 if valid:
                     valid_count += 1
-                    print(f"  ✅ [{service}] {key[:25]}... -> {info}")
-                    print(f"     📍 Source: {source_url}")
+                    print(f"  [{service}] {key[:25]}... -> {info}")
+                    print(f"     Source: {source_url}")
 
                     with valid_lock:
                         found_valid_keys.append((key, service, balance, info, source_url, source_type, datetime.now()))
@@ -793,16 +793,16 @@ def verify_batch(worker_id, batch, g):
                     handle_leak(g, key, service, info, source_url, source_type, author, balance)
                 else:
                     invalid_count += 1
-                    print(f"  ❌ [{service}] {key[:25]}... -> {info}")
-                    print(f"     📍 Source: {source_url}")
+                    print(f"  [{service}] {key[:25]}... -> {info}")
+                    print(f"     Source: {source_url}")
             except Exception as e:
                 invalid_count += 1
-                print(f"  ❌ Exception: {e}")
+                print(f"  Exception: {e}")
         
         if is_timeout_trigger:
-            safe_print(f"[Worker-{worker_id}] 📊 Timeout batch completed: {valid_count} valid, {invalid_count} invalid (total {len(batch)})")
+            safe_print(f"[Worker-{worker_id}] Timeout batch completed: {valid_count} valid, {invalid_count} invalid (total {len(batch)})")
         else:
-            safe_print(f"[Worker-{worker_id}] 📊 Batch completed: {valid_count}/{len(batch)} valid keys")
+            safe_print(f"[Worker-{worker_id}] Batch completed: {valid_count}/{len(batch)} valid keys")
 
 def check_pending_timeout(worker_id, g):
     with batch_locks.get(worker_id, Lock()):
@@ -816,7 +816,7 @@ def check_pending_timeout(worker_id, g):
                 if worker_id in pending_batch_times:
                     del pending_batch_times[worker_id]
                 
-                safe_print(f"[Worker-{worker_id}] ⏰ Triggering verification by timeout ({elapsed:.0f}s, {count} keys)")
+                safe_print(f"[Worker-{worker_id}] Triggering verification by timeout ({elapsed:.0f}s, {count} keys)")
                 executor = ThreadPoolExecutor(max_workers=1)
                 executor.submit(verify_batch, worker_id, batch, g)
                 executor.shutdown(wait=False)
@@ -846,7 +846,7 @@ def add_key_to_pending(worker_id, key, service, source_url, source_type, author,
             if worker_id in pending_batch_times:
                 del pending_batch_times[worker_id]
             
-            safe_print(f"[Worker-{worker_id}] 📦 Triggering verification by batch size ({count} keys)")
+            safe_print(f"[Worker-{worker_id}] Triggering verification by batch size ({count} keys)")
             executor = ThreadPoolExecutor(max_workers=1)
             executor.submit(verify_batch, worker_id, batch, g)
             executor.shutdown(wait=False)
@@ -858,43 +858,43 @@ def extract_and_queue(text, source_url, source_type, worker_id, author, g):
         file_content = get_full_file_content(source_url)
         if file_content:
             full_text = file_content
-            print(f"    📄 Using full file content for code (all keys from this file)")
+            print(f"    Using full file content for code (all keys from this file)")
     
     elif source_type == "env" and "/blob/" in source_url:
         env_content = get_full_env_content(source_url)
         if env_content:
             full_text = env_content
-            print(f"    📄 Using full .env file content (all keys from this file)")
+            print(f"    Using full .env file content (all keys from this file)")
     
     elif source_type == "issue" and "/issues/" in source_url:
         issue_content = get_full_issue_content(g, source_url)
         if issue_content:
             full_text = issue_content
-            print(f"    📄 Using full issue content (title + body + comments)")
+            print(f"    Using full issue content (title + body + comments)")
     
     elif "/pull/" in source_url:
         pr_content = get_full_pr_content(g, source_url)
         if pr_content:
             full_text = pr_content
-            print(f"    📄 Using full PR content (description + comments + diff)")
+            print(f"    Using full PR content (description + comments + diff)")
     
     elif source_type == "commit" and "/commit/" in source_url:
         commit_content = get_full_commit_content(g, source_url)
         if commit_content:
             full_text = commit_content
-            print(f"    📄 Using full commit diff")
+            print(f"    Using full commit diff")
     
     for service, pattern in KEY_PATTERNS.items():
         for match in pattern.finditer(full_text):
             key = match.group(0)
-            print(f"  🔑 Found {service} key in {source_type}: {source_url[:80]}...")
+            print(f"  Found {service} key in {source_type}: {source_url[:80]}...")
             add_key_to_pending(worker_id, key, service, source_url, source_type, author, g)
     
     check_pending_timeout(worker_id, g)
 
-# ========== 搜索 Workers ==========
+# 搜索 Workers
 def search_code_worker(worker_id, start_page, g):
-    safe_print(f"\n[Worker-{worker_id}] 🚀 Starting CODE scan from page {start_page} (infinite)")
+    safe_print(f"\n[Worker-{worker_id}] Starting CODE scan from page {start_page} (infinite)")
     page = start_page
     items_processed = 0
     consecutive_empty = 0
@@ -931,7 +931,7 @@ def search_code_worker(worker_id, start_page, g):
 
             consecutive_empty = 0
 
-            safe_print(f"[Worker-{worker_id}] 📄 CODE page {page}: {len(items)} items (total: {items_processed + len(items)})")
+            safe_print(f"[Worker-{worker_id}] CODE page {page}: {len(items)} items (total: {items_processed + len(items)})")
 
             for item in items:
                 if stop_event.is_set():
@@ -953,7 +953,7 @@ def search_code_worker(worker_id, start_page, g):
     safe_print(f"[Worker-{worker_id}] CODE scan finished, processed {items_processed} items")
 
 def search_issues_worker(worker_id, start_page, g):
-    safe_print(f"\n[Worker-{worker_id}] 🚀 Starting ISSUE scan from page {start_page} (infinite)")
+    safe_print(f"\n[Worker-{worker_id}] Starting ISSUE scan from page {start_page} (infinite)")
     query = ISSUE_QUERY
     page = start_page
     items_processed = 0
@@ -991,7 +991,7 @@ def search_issues_worker(worker_id, start_page, g):
 
             consecutive_empty = 0
 
-            safe_print(f"[Worker-{worker_id}] 📄 ISSUE page {page}: {len(items)} items (total: {items_processed + len(items)})")
+            safe_print(f"[Worker-{worker_id}] ISSUE page {page}: {len(items)} items (total: {items_processed + len(items)})")
 
             for item in items:
                 if stop_event.is_set():
@@ -1010,10 +1010,10 @@ def search_issues_worker(worker_id, start_page, g):
             safe_sleep(5)
             continue
 
-    safe_print(f("[Worker-{worker_id}] ISSUE scan finished, processed {items_processed} items")
+    safe_print(f"[Worker-{worker_id}] ISSUE scan finished, processed {items_processed} items")
 
 def search_commits_worker(worker_id, start_page, g):
-    safe_print(f"\n[Worker-{worker_id}] 🚀 Starting COMMIT scan from page {start_page} (infinite)")
+    safe_print(f"\n[Worker-{worker_id}] Starting COMMIT scan from page {start_page} (infinite)")
     page = start_page
     items_processed = 0
     consecutive_empty = 0
@@ -1050,7 +1050,7 @@ def search_commits_worker(worker_id, start_page, g):
 
             consecutive_empty = 0
 
-            safe_print(f"[Worker-{worker_id}] 📄 COMMIT page {page}: {len(items)} items (total: {items_processed + len(items)})")
+            safe_print(f"[Worker-{worker_id}] COMMIT page {page}: {len(items)} items (total: {items_processed + len(items)})")
 
             for item in items:
                 if stop_event.is_set():
@@ -1071,9 +1071,8 @@ def search_commits_worker(worker_id, start_page, g):
 
     safe_print(f"[Worker-{worker_id}] COMMIT scan finished, processed {items_processed} items")
 
-# ========== .env 专用搜索线程 ==========
 def search_env_worker(worker_id, start_page, g):
-    safe_print(f"\n[Worker-{worker_id}] 🚀 Starting ENV file scan (page {start_page})")
+    safe_print(f"\n[Worker-{worker_id}] Starting ENV file scan (page {start_page})")
     page = start_page
     items_processed = 0
     consecutive_empty = 0
@@ -1110,7 +1109,7 @@ def search_env_worker(worker_id, start_page, g):
 
             consecutive_empty = 0
 
-            safe_print(f"[Worker-{worker_id}] 📄 ENV page {page}: {len(items)} items (total: {items_processed + len(items)})")
+            safe_print(f"[Worker-{worker_id}] ENV page {page}: {len(items)} items (total: {items_processed + len(items)})")
 
             for item in items:
                 if stop_event.is_set():
@@ -1133,24 +1132,21 @@ def search_env_worker(worker_id, start_page, g):
 
 def main():
     print("=" * 70)
-    print("🤖 API Key Leak Scanner - Full Content Extraction with Enhanced Deduplication")
-    print(f"📁 Fallback repo: {REPO_NAME}")
-    print(f"⏱️  Max runtime: {MAX_RUNTIME_SECONDS}s (29.5 minutes)")
-    print(f"📦 Batch size: {BATCH_SIZE} keys OR {BATCH_TIMEOUT}s timeout")
-    print(f"💾 Cache: max {MAX_CACHE_SIZE} items, TTL {MAX_CACHE_AGE}s")
-    print(f"⏲️  Max backoff: {MAX_BACKOFF}s")
-    print("📊 Scanning: CODE + ISSUES + COMMITS + ENV (infinite pages)")
-    print("📊 Feature: Full content extraction for all sources (no key left behind)")
-    print("📊 Notification: Issues/PRs get direct replies; Code files get issues; Commits logged only")
-    print("📊 Deduplication: Key + Source URL + Combo")
+    print("API Key Leak Scanner - Full Content Extraction")
+    print(f"Fallback repo: {REPO_NAME}")
+    print(f"Max runtime: {MAX_RUNTIME_SECONDS}s (29.5 minutes)")
+    print(f"Batch size: {BATCH_SIZE} keys OR {BATCH_TIMEOUT}s timeout")
+    print(f"Cache: max {MAX_CACHE_SIZE} items, TTL {MAX_CACHE_AGE}s")
+    print(f"Max backoff: {MAX_BACKOFF}s")
+    print("Scanning: CODE + ISSUES + COMMITS + ENV (infinite pages)")
     print("=" * 70)
 
     g = get_github_client()
     if not g:
-        print("❌ Failed to initialize GitHub client")
+        print("Failed to initialize GitHub client")
         return
 
-    print("✅ GitHub client initialized\n")
+    print("GitHub client initialized\n")
 
     with ThreadPoolExecutor(max_workers=SEARCH_WORKERS) as executor:
         futures = [
@@ -1166,12 +1162,12 @@ def main():
             except:
                 pass
 
-    print(f"\n✅ Scan completed. Found {len(found_valid_keys)} valid keys.")
+    print(f"\nScan completed. Found {len(found_valid_keys)} valid keys.")
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print(f"❌ Fatal error: {e}")
+        print(f"Fatal error: {e}")
         save_final_results()
         sys.exit(1)
