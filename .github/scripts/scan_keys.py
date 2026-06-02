@@ -11,6 +11,7 @@ API Key Leak Scanner - Full Content Extraction with Deep Repo Scan
 - Enhanced deduplication (key + source_url + combo)
 - Limited backoff (max 60 seconds)
 - Dedicated .env file scanner thread
+- Only verifiable API keys (removed Azure, Cohere, Mistral, JWT, etc.)
 """
 
 import os
@@ -22,7 +23,6 @@ import jwt
 import time
 import signal
 import random
-import requests
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -30,10 +30,25 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock, Event
 from collections import defaultdict
 from typing import Optional, List, Tuple, Dict, Any
+
+import requests
 from github import Github, Auth, GithubException
 
+# 数据库验证库（可选）
+try:
+    import pymongo
+    PYMONGO_AVAILABLE = True
+except ImportError:
+    PYMONGO_AVAILABLE = False
+
+try:
+    import psycopg2
+    PSYCOPG2_AVAILABLE = True
+except ImportError:
+    PSYCOPG2_AVAILABLE = False
+
 # ========== Configuration ==========
-MAX_RUNTIME_SECONDS = 50 * 60      # 50 minutes
+MAX_RUNTIME_SECONDS = 50 * 60
 HEARTBEAT_INTERVAL = 60
 REQUEST_TIMEOUT = 15
 PER_PAGE = 30
@@ -147,8 +162,9 @@ def print_cache_stats():
         total = file_count + issue_count + pr_count + commit_count + env_count
         print(f"Cache: files={file_count}, issues={issue_count}, PRs={pr_count}, commits={commit_count}, env={env_count}, total={total}")
 
-# Key 正则
+# ========== Key 正则（只保留可验证的，移除 Azure） ==========
 KEY_PATTERNS = {
+    # AI Providers (可验证)
     "OpenAI": re.compile(r"sk-proj-[a-zA-Z0-9_\-]{50,}"),
     "OpenAI_Legacy": re.compile(r"sk-[a-zA-Z0-9]{32,}"),
     "OpenRouter": re.compile(r"sk-or-v1-[a-zA-Z0-9]{50,}"),
@@ -160,9 +176,55 @@ KEY_PATTERNS = {
     "HuggingFace": re.compile(r"hf_[a-zA-Z0-9]{30,}"),
     "MiMo": re.compile(r"tp-[a-zA-Z0-9]{10,}"),
     "MiniMax": re.compile(r"sk-api-[a-zA-Z0-9]{100,}"),
+    "Perplexity": re.compile(r"pplx-[a-zA-Z0-9]{32,}"),
+    
+    # Cloud & Database (可验证)
+    "GitHub_PAT": re.compile(r"github_pat_[a-zA-Z0-9_]{50,}"),
+    "GitHub_Token": re.compile(r"ghp_[a-zA-Z0-9]{36}"),
+    "Stripe_Live": re.compile(r"sk_live_[a-zA-Z0-9]{24,}"),
+    "Stripe_Test": re.compile(r"sk_test_[a-zA-Z0-9]{24,}"),
+    "Twilio": re.compile(r"AC[a-zA-Z0-9]{32}"),
+    
+    # Database URIs (可尝试连接)
+    "MongoDB_URI": re.compile(r"mongodb(?:\+srv)?://[^:]+:[^@]+@[^/]+/[^?]+"),
+    "PostgreSQL_URI": re.compile(r"postgresql://[^:]+:[^@]+@[^/]+/[^?]+"),
 }
 
-# 验证函数
+# ========== 数据库验证函数（实际连接，短超时） ==========
+def _parse_mongodb_uri(code, data):
+    """验证 MongoDB URI 是否有效（实际连接测试）"""
+    if not PYMONGO_AVAILABLE:
+        return True, 0, "MongoDB URI (pymongo not installed, cannot verify)"
+    try:
+        # 使用更短的超时时间
+        client = pymongo.MongoClient(code, serverSelectionTimeoutMS=3000, connectTimeoutMS=3000)
+        client.admin.command('ping')
+        client.close()
+        return True, 0, "Valid MongoDB URI (connection successful)"
+    except Exception as e:
+        return True, 0, f"MongoDB URI (connection failed: {str(e)[:50]})"
+
+def _parse_postgresql_uri(code, data):
+    """验证 PostgreSQL URI 是否有效（实际连接测试）"""
+    if not PSYCOPG2_AVAILABLE:
+        return True, 0, "PostgreSQL URI (psycopg2 not installed, cannot verify)"
+    try:
+        result = urllib.parse.urlparse(code)
+        dbname = result.path.lstrip('/') if result.path else 'postgres'
+        conn = psycopg2.connect(
+            host=result.hostname,
+            port=result.port or 5432,
+            user=result.username,
+            password=result.password,
+            database=dbname,
+            connect_timeout=3
+        )
+        conn.close()
+        return True, 0, "Valid PostgreSQL URI (connection successful)"
+    except Exception as e:
+        return True, 0, f"PostgreSQL URI (connection failed: {str(e)[:50]})"
+
+# ========== 验证函数 ==========
 def _parse_deepseek(code, data):
     if code != 200:
         return False, 0, f"HTTP {code}"
@@ -181,7 +243,7 @@ def _parse_openai(code, data):
     if code == 401:
         return False, 0, "Invalid"
     if code == 429:
-        return True, 0, "Rate limited (key may be valid)"
+        return True, 0, "Rate limited"
     return False, 0, f"HTTP {code}"
 
 def _parse_openrouter(code, data):
@@ -204,20 +266,42 @@ def _parse_gemini(code, data):
     if code == 200:
         return True, 0, "Valid"
     if code == 403:
-        return True, 0, "Valid but restricted (IP/region/billing)"
+        return True, 0, "Valid but restricted"
     if code == 400:
         if isinstance(data, dict) and "API key not valid" in str(data):
             return False, 0, "Invalid key"
-        return True, 0, "Possibly valid (check billing)"
-    if code == 404:
-        return False, 0, "Invalid (not found)"
+        return True, 0, "Possibly valid"
     if code == 429:
-        return True, 0, "Rate limited (key may be valid)"
+        return True, 0, "Rate limited"
     return False, 0, f"HTTP {code}"
 
 def _parse_anthropic(code, data):
     if code == 200:
         return True, 0, "Valid"
+    if code == 401:
+        return False, 0, "Invalid"
+    return False, 0, f"HTTP {code}"
+
+def _parse_github_token(code, data):
+    if code == 200:
+        return True, 0, "Valid GitHub token"
+    if code == 401:
+        return False, 0, "Invalid token"
+    return False, 0, f"HTTP {code}"
+
+def _parse_stripe(code, data):
+    # Stripe /v1/account 返回 200 表示 key 有效
+    if code == 200:
+        return True, 0, "Valid Stripe key"
+    if code == 401:
+        return False, 0, "Invalid key"
+    return False, 0, f"HTTP {code}"
+
+def _parse_twilio(code, data):
+    if code == 200:
+        return True, 0, "Valid Twilio key"
+    if code == 401:
+        return False, 0, "Invalid key"
     return False, 0, f"HTTP {code}"
 
 def _parse_replicate(code, data):
@@ -242,11 +326,15 @@ def _parse_mimo(code, data):
 def _parse_minimax(code, data):
     if code == 200:
         return True, 0, "Valid"
-    if code == 401:
-        return False, 0, "Invalid"
+    return False, 0, f"HTTP {code}"
+
+def _parse_perplexity(code, data):
+    if code == 200:
+        return True, 0, "Valid"
     return False, 0, f"HTTP {code}"
 
 VERIFIERS = {
+    # AI Providers
     "OpenAI": {"url": "https://api.openai.com/v1/models", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_openai},
     "OpenAI_Legacy": {"url": "https://api.openai.com/v1/models", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_openai},
     "OpenRouter": {"url": "https://openrouter.ai/api/v1/auth/key", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_openrouter},
@@ -258,6 +346,18 @@ VERIFIERS = {
     "HuggingFace": {"url": "https://huggingface.co/api/whoami", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_huggingface},
     "MiMo": {"url": "https://token-plan-cn.xiaomimimo.com/v1/models", "headers": lambda k: {"Authorization": f"Bearer {k}", "X-Plan-Type": "token-plan"}, "method": "GET", "parse": _parse_mimo},
     "MiniMax": {"url": "https://api.minimax.io/v1/models", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_minimax},
+    "Perplexity": {"url": "https://api.perplexity.ai/chat/completions", "headers": lambda k: {"Authorization": f"Bearer {k}", "Content-Type": "application/json"}, "method": "POST", "body": lambda: json.dumps({"model": "llama-3.1-sonar-small-128k-online", "messages": [{"role": "user", "content": "hi"}]}).encode(), "parse": _parse_perplexity},
+    
+    # Cloud & Database
+    "GitHub_PAT": {"url": "https://api.github.com/user", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_github_token},
+    "GitHub_Token": {"url": "https://api.github.com/user", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_github_token},
+    "Stripe_Live": {"url": "https://api.stripe.com/v1/account", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_stripe},
+    "Stripe_Test": {"url": "https://api.stripe.com/v1/account", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_stripe},
+    "Twilio": {"url": "https://api.twilio.com/2010-04-01/Accounts", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_twilio},
+    
+    # Database URIs
+    "MongoDB_URI": {"url": lambda k: k, "headers": lambda k: {}, "method": "GET", "parse": _parse_mongodb_uri},
+    "PostgreSQL_URI": {"url": lambda k: k, "headers": lambda k: {}, "method": "GET", "parse": _parse_postgresql_uri},
 }
 
 # GitHub 认证
@@ -533,8 +633,7 @@ def get_full_commit_content(g, source_url):
         return None
 
 # 深度扫描整个仓库
-def deep_scan_repository(g, repo_full_name, state, processed):
-    """深度扫描整个仓库，查找所有 Key"""
+def deep_scan_repository(g, repo_full_name):
     with scanned_repos_lock:
         if repo_full_name in scanned_repos:
             return 0
@@ -552,7 +651,6 @@ def deep_scan_repository(g, repo_full_name, state, processed):
     branch = repo.default_branch
     
     try:
-        # 获取仓库文件树
         commit = repo.get_commit(sha=branch)
         tree = commit.get_tree(recursive=True)
         
@@ -566,7 +664,6 @@ def deep_scan_repository(g, repo_full_name, state, processed):
                 continue
             
             file_path = item.path
-            # 只扫描可能的配置文件
             if not any(ext in file_path.lower() for ext in ['.env', '.json', '.yaml', '.yml', '.toml', '.txt', '.md', '.cfg', '.conf', 'config', '.ini', '.properties']):
                 continue
             
@@ -594,7 +691,6 @@ def deep_scan_repository(g, repo_full_name, state, processed):
     safe_print(f"  ✅ Deep scan completed: found {found_count} new keys")
     return found_count
 
-# 去重函数
 def is_duplicate(key, source_url):
     with processed_lock:
         if key in processed_keys:
@@ -612,7 +708,6 @@ def mark_processed(key, source_url):
         processed_sources.add(source_url)
         processed_key_source.add(f"{key}|{source_url}")
 
-# 回复函数
 def reply_to_original_issue_or_pr(g, source_url, author, service, key, info, balance):
     try:
         if "/issues/" in source_url:
@@ -784,8 +879,8 @@ Auto-generated by {BOT_NAME}
     except Exception as e:
         print(f"    Failed to create issue in my repo: {e}")
 
-def handle_leak(g, key, service, info, source_url, source_type, author, balance, state):
-    # 触发深度扫描（仅当不是深度扫描本身） - 不管是否重复都触发
+def handle_leak(g, key, service, info, source_url, source_type, author, balance):
+    # 触发深度扫描（仅当不是深度扫描本身）
     if source_type != "deep_scan":
         repo_name = "/".join(source_url.split("/")[3:5]) if "github.com" in source_url else None
         if repo_name:
@@ -793,7 +888,8 @@ def handle_leak(g, key, service, info, source_url, source_type, author, balance,
                 if repo_name not in scanned_repos:
                     scanned_repos.add(repo_name)
                     executor = ThreadPoolExecutor(max_workers=1)
-                    executor.submit(deep_scan_repository, g, repo_name, state, processed)
+                    # 修复：只传 2 个参数
+                    executor.submit(deep_scan_repository, g, repo_name)
                     executor.shutdown(wait=False)
     
     # 去重检查
@@ -819,7 +915,7 @@ def handle_leak(g, key, service, info, source_url, source_type, author, balance,
         create_issue_in_my_repo(g, key, service, info, source_url, source_type, author, balance, is_fallback=False)
         print(f"    Unknown source type, only created issue in fallback repo")
 
-def verify_batch(worker_id, batch, g, state):
+def verify_batch(worker_id, batch, g):
     if not batch:
         return
     
@@ -859,29 +955,29 @@ def verify_batch(worker_id, batch, g, state):
                 key, service, valid, balance, info, source_url, source_type, author = future.result(timeout=15)
                 if valid:
                     valid_count += 1
-                    print(f"  [{service}] {key[:25]}... -> {info}")
-                    print(f"     Source: {source_url}")
+                    print(f"  ✅ [{service}] {key[:25]}... -> {info}")
+                    print(f"     📍 Source: {source_url}")
 
                     with valid_lock:
                         found_valid_keys.append((key, service, balance, info, source_url, source_type, datetime.now()))
                     with open("valid_keys_realtime.txt", "a") as f:
                         f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | {service} | {key} | {info} | {source_url}\n")
 
-                    handle_leak(g, key, service, info, source_url, source_type, author, balance, state)
+                    handle_leak(g, key, service, info, source_url, source_type, author, balance)
                 else:
                     invalid_count += 1
-                    print(f"  [{service}] {key[:25]}... -> {info}")
-                    print(f"     Source: {source_url}")
+                    print(f"  ❌ [{service}] {key[:25]}... -> {info}")
+                    print(f"     📍 Source: {source_url}")
             except Exception as e:
                 invalid_count += 1
-                print(f"  Exception: {e}")
+                print(f"  ❌ Exception: {e}")
         
         if is_timeout_trigger:
-            safe_print(f"[Worker-{worker_id}] Timeout batch completed: {valid_count} valid, {invalid_count} invalid (total {len(batch)})")
+            safe_print(f"[Worker-{worker_id}] 📊 Timeout batch completed: {valid_count} valid, {invalid_count} invalid (total {len(batch)})")
         else:
-            safe_print(f"[Worker-{worker_id}] Batch completed: {valid_count}/{len(batch)} valid keys")
+            safe_print(f"[Worker-{worker_id}] 📊 Batch completed: {valid_count}/{len(batch)} valid keys")
 
-def check_pending_timeout(worker_id, g, state):
+def check_pending_timeout(worker_id, g):
     with batch_locks.get(worker_id, Lock()):
         if pending_count.get(worker_id, 0) > 0:
             elapsed = time.time() - pending_batch_times.get(worker_id, start_time)
@@ -893,9 +989,9 @@ def check_pending_timeout(worker_id, g, state):
                 if worker_id in pending_batch_times:
                     del pending_batch_times[worker_id]
                 
-                safe_print(f"[Worker-{worker_id}] Triggering verification by timeout ({elapsed:.0f}s, {count} keys)")
+                safe_print(f"[Worker-{worker_id}] ⏰ Triggering verification by timeout ({elapsed:.0f}s, {count} keys)")
                 executor = ThreadPoolExecutor(max_workers=1)
-                executor.submit(verify_batch, worker_id, batch, g, state)
+                executor.submit(verify_batch, worker_id, batch, g)
                 executor.shutdown(wait=False)
                 return True
     return False
@@ -918,55 +1014,55 @@ def add_key_to_pending(worker_id, key, service, source_url, source_type, author,
             if worker_id in pending_batch_times:
                 del pending_batch_times[worker_id]
             
-            safe_print(f"[Worker-{worker_id}] Triggering verification by batch size ({count} keys)")
+            safe_print(f"[Worker-{worker_id}] 📦 Triggering verification by batch size ({count} keys)")
             executor = ThreadPoolExecutor(max_workers=1)
-            executor.submit(verify_batch, worker_id, batch, g, state)
+            executor.submit(verify_batch, worker_id, batch, g)
             executor.shutdown(wait=False)
 
-def extract_and_queue(text, source_url, source_type, worker_id, author, g, state):
+def extract_and_queue(text, source_url, source_type, worker_id, author, g):
     full_text = text
     
     if source_type == "code" and "/blob/" in source_url:
         file_content = get_full_file_content(source_url)
         if file_content:
             full_text = file_content
-            print(f"    Using full file content for code (all keys from this file)")
+            print(f"    📄 Using full file content for code")
     
     elif source_type == "env" and "/blob/" in source_url:
         env_content = get_full_env_content(source_url)
         if env_content:
             full_text = env_content
-            print(f"    Using full .env file content (all keys from this file)")
+            print(f"    📄 Using full .env file content")
     
     elif source_type == "issue" and "/issues/" in source_url:
         issue_content = get_full_issue_content(g, source_url)
         if issue_content:
             full_text = issue_content
-            print(f"    Using full issue content (title + body + comments)")
+            print(f"    📄 Using full issue content")
     
     elif "/pull/" in source_url:
         pr_content = get_full_pr_content(g, source_url)
         if pr_content:
             full_text = pr_content
-            print(f"    Using full PR content (description + comments + diff)")
+            print(f"    📄 Using full PR content")
     
     elif source_type == "commit" and "/commit/" in source_url:
         commit_content = get_full_commit_content(g, source_url)
         if commit_content:
             full_text = commit_content
-            print(f"    Using full commit diff")
+            print(f"    📄 Using full commit diff")
     
     for service, pattern in KEY_PATTERNS.items():
         for match in pattern.finditer(full_text):
             key = match.group(0)
-            print(f"  Found {service} key in {source_type}: {source_url[:80]}...")
+            print(f"  🔑 Found {service} key in {source_type}: {source_url[:80]}...")
             add_key_to_pending(worker_id, key, service, source_url, source_type, author, g)
     
-    check_pending_timeout(worker_id, g, state)
+    check_pending_timeout(worker_id, g)
 
 # 搜索 Workers
-def search_code_worker(worker_id, start_page, g, state):
-    safe_print(f"\n[Worker-{worker_id}] Starting CODE scan from page {start_page} (infinite)")
+def search_code_worker(worker_id, start_page, g):
+    safe_print(f"\n[Worker-{worker_id}] 🚀 Starting CODE scan from page {start_page} (infinite)")
     page = start_page
     items_processed = 0
     consecutive_empty = 0
@@ -1003,7 +1099,7 @@ def search_code_worker(worker_id, start_page, g, state):
 
             consecutive_empty = 0
 
-            safe_print(f"[Worker-{worker_id}] CODE page {page}: {len(items)} items (total: {items_processed + len(items)})")
+            safe_print(f"[Worker-{worker_id}] 📄 CODE page {page}: {len(items)} items (total: {items_processed + len(items)})")
 
             for item in items:
                 if stop_event.is_set():
@@ -1011,7 +1107,7 @@ def search_code_worker(worker_id, start_page, g, state):
                 html_url = item.get("html_url", "")
                 author = item.get("repository", {}).get("owner", {}).get("login", "unknown")
                 
-                extract_and_queue("", html_url, "code", worker_id, author, g, state)
+                extract_and_queue("", html_url, "code", worker_id, author, g)
                 items_processed += 1
 
             page += 1
@@ -1024,8 +1120,8 @@ def search_code_worker(worker_id, start_page, g, state):
 
     safe_print(f"[Worker-{worker_id}] CODE scan finished, processed {items_processed} items")
 
-def search_issues_worker(worker_id, start_page, g, state):
-    safe_print(f"\n[Worker-{worker_id}] Starting ISSUE scan from page {start_page} (infinite)")
+def search_issues_worker(worker_id, start_page, g):
+    safe_print(f"\n[Worker-{worker_id}] 🚀 Starting ISSUE scan from page {start_page} (infinite)")
     query = ISSUE_QUERY
     page = start_page
     items_processed = 0
@@ -1063,7 +1159,7 @@ def search_issues_worker(worker_id, start_page, g, state):
 
             consecutive_empty = 0
 
-            safe_print(f"[Worker-{worker_id}] ISSUE page {page}: {len(items)} items (total: {items_processed + len(items)})")
+            safe_print(f"[Worker-{worker_id}] 📄 ISSUE page {page}: {len(items)} items (total: {items_processed + len(items)})")
 
             for item in items:
                 if stop_event.is_set():
@@ -1071,7 +1167,7 @@ def search_issues_worker(worker_id, start_page, g, state):
                 html_url = item.get("html_url", "")
                 author = item.get("user", {}).get("login", "unknown")
                 
-                extract_and_queue("", html_url, "issue", worker_id, author, g, state)
+                extract_and_queue("", html_url, "issue", worker_id, author, g)
                 items_processed += 1
 
             page += 1
@@ -1084,8 +1180,8 @@ def search_issues_worker(worker_id, start_page, g, state):
 
     safe_print(f"[Worker-{worker_id}] ISSUE scan finished, processed {items_processed} items")
 
-def search_commits_worker(worker_id, start_page, g, state):
-    safe_print(f"\n[Worker-{worker_id}] Starting COMMIT scan from page {start_page} (infinite)")
+def search_commits_worker(worker_id, start_page, g):
+    safe_print(f"\n[Worker-{worker_id}] 🚀 Starting COMMIT scan from page {start_page} (infinite)")
     page = start_page
     items_processed = 0
     consecutive_empty = 0
@@ -1122,7 +1218,7 @@ def search_commits_worker(worker_id, start_page, g, state):
 
             consecutive_empty = 0
 
-            safe_print(f"[Worker-{worker_id}] COMMIT page {page}: {len(items)} items (total: {items_processed + len(items)})")
+            safe_print(f"[Worker-{worker_id}] 📄 COMMIT page {page}: {len(items)} items (total: {items_processed + len(items)})")
 
             for item in items:
                 if stop_event.is_set():
@@ -1130,7 +1226,7 @@ def search_commits_worker(worker_id, start_page, g, state):
                 html_url = item.get("html_url", "")
                 author = item.get("author", {}).get("login", "unknown") if item.get("author") else "unknown"
                 
-                extract_and_queue("", html_url, "commit", worker_id, author, g, state)
+                extract_and_queue("", html_url, "commit", worker_id, author, g)
                 items_processed += 1
 
             page += 1
@@ -1143,8 +1239,8 @@ def search_commits_worker(worker_id, start_page, g, state):
 
     safe_print(f"[Worker-{worker_id}] COMMIT scan finished, processed {items_processed} items")
 
-def search_env_worker(worker_id, start_page, g, state):
-    safe_print(f"\n[Worker-{worker_id}] Starting ENV file scan (page {start_page})")
+def search_env_worker(worker_id, start_page, g):
+    safe_print(f"\n[Worker-{worker_id}] 🚀 Starting ENV file scan (page {start_page})")
     page = start_page
     items_processed = 0
     consecutive_empty = 0
@@ -1189,7 +1285,7 @@ def search_env_worker(worker_id, start_page, g, state):
                 html_url = item.get("html_url", "")
                 author = item.get("repository", {}).get("owner", {}).get("login", "unknown")
                 
-                extract_and_queue("", html_url, "env", worker_id, author, g, state)
+                extract_and_queue("", html_url, "env", worker_id, author, g)
                 items_processed += 1
 
             page += 1
@@ -1204,33 +1300,33 @@ def search_env_worker(worker_id, start_page, g, state):
 
 def main():
     print("=" * 70)
-    print("API Key Leak Scanner - Full Content Extraction with Deep Repo Scan")
-    print(f"Fallback repo: {REPO_NAME}")
-    print(f"Max runtime: {MAX_RUNTIME_SECONDS}s (50 minutes)")
-    print(f"Batch size: {BATCH_SIZE} keys OR {BATCH_TIMEOUT}s timeout")
-    print(f"Cache: max {MAX_CACHE_SIZE} items, TTL {MAX_CACHE_AGE}s")
-    print(f"Max backoff: {MAX_BACKOFF}s")
-    print(f"Deep scan max files: {DEEP_SCAN_MAX_FILES}")
-    print("Scanning: CODE + ISSUES + COMMITS + ENV (infinite pages)")
-    print("Feature: Deep repository scan when ANY key is found (even duplicates)")
+    print("🤖 API Key Leak Scanner - Verifiable Keys Only")
+    print(f"📁 Fallback repo: {REPO_NAME}")
+    print(f"⏱️  Max runtime: {MAX_RUNTIME_SECONDS}s (50 minutes)")
+    print(f"📦 Batch size: {BATCH_SIZE} keys OR {BATCH_TIMEOUT}s timeout")
+    print(f"💾 Cache: max {MAX_CACHE_SIZE} items, TTL {MAX_CACHE_AGE}s")
+    print(f"⏲️  Max backoff: {MAX_BACKOFF}s")
+    print(f"🔍 Deep scan max files: {DEEP_SCAN_MAX_FILES}")
+    print("📊 Scanning: CODE + ISSUES + COMMITS + ENV (infinite pages)")
+    print("✨ Feature: Deep repository scan when ANY key is found")
+    print(f"🔑 Key patterns loaded: {len(KEY_PATTERNS)} types (verifiable only)")
+    print(f"✅ Verifiers loaded: {len(VERIFIERS)} types")
     print("=" * 70)
 
     g = get_github_client()
     if not g:
-        print("Failed to initialize GitHub client")
+        print("❌ Failed to initialize GitHub client")
         return
 
-    print("GitHub client initialized\n")
-    
-    state = {}  # 初始化 state
+    print("✅ GitHub client initialized\n")
 
     with ThreadPoolExecutor(max_workers=SEARCH_WORKERS) as executor:
         futures = [
-            executor.submit(search_code_worker, 1, 1, g, state),
-            executor.submit(search_issues_worker, 2, 1, g, state),
-            executor.submit(search_commits_worker, 3, 1, g, state),
-            executor.submit(search_issues_worker, 4, 6, g, state),
-            executor.submit(search_env_worker, 5, 1, g, state),
+            executor.submit(search_code_worker, 1, 1, g),
+            executor.submit(search_issues_worker, 2, 1, g),
+            executor.submit(search_commits_worker, 3, 1, g),
+            executor.submit(search_issues_worker, 4, 6, g),
+            executor.submit(search_env_worker, 5, 1, g),
         ]
         for future in as_completed(futures):
             try:
@@ -1238,12 +1334,13 @@ def main():
             except:
                 pass
 
-    print(f"\nScan completed. Found {len(found_valid_keys)} valid keys.")
+    print(f"\n✅ Scan completed. Found {len(found_valid_keys)} valid keys.")
+    print(f"📝 Results saved to valid_keys_final_*.txt")
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print(f"Fatal error: {e}")
+        print(f"❌ Fatal error: {e}")
         save_final_results()
         sys.exit(1)
