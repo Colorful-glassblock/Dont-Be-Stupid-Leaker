@@ -12,6 +12,10 @@ Dont-Be-Stupid-Leaker
 
 ---
 
+![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/Colorful-glassblock/Dont-Be-Stupid-Leaker/scan.yml)
+![GitHub Issues](https://img.shields.io/github/issues/Colorful-glassblock/Dont-Be-Stupid-Leaker)
+![GitHub last commit](https://img.shields.io/github/last-commit/Colorful-glassblock/Dont-Be-Stupid-Leaker)
+
 What is This / 这是什么
 
 ```
