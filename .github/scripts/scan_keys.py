@@ -1,17 +1,10 @@
 #!/usr/bin/env python3
 """
-API Key Leak Scanner - Full Content Extraction with Deep Repo Scan
-- Fetches complete content for all source types (Code/Issues/PRs/Commits/Env files)
-- When a key is found, triggers deep scan of the entire repository
-- Creates issues without labels if label creation fails
-- Random browser User-Agent for all HTTP requests
-- Auto-verify on batch size OR 60s timeout
-- LRU cache with size and TTL limits to prevent OOM
-- Replies to Issues and PRs directly in original repository
-- Enhanced deduplication (key + source_url + combo)
-- Limited backoff (max 60 seconds)
-- Dedicated .env file scanner thread
-- Only verifiable API keys (removed Azure, Cohere, Mistral, JWT, etc.)
+API Key Leak Scanner - Production Ready v2.9
+- Removed dead DB URI masking code (no DB scanning since v1)
+- Safe author extraction in deep_scan (fallback to 'unknown')
+- Shannon entropy filter on key body only (prefixes stripped)
+- All previous fixes: graceful timeout, URL encoding, worker idle loops, quota optimizations
 """
 
 import os
@@ -25,43 +18,36 @@ import signal
 import random
 import urllib.parse
 import urllib.request
+import math
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock, Event
-from collections import defaultdict
-from typing import Optional, List, Tuple, Dict, Any
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock, Event, RLock
+from collections import defaultdict, Counter
+from typing import Optional, List, Tuple, Dict, Any, Set
+from dataclasses import dataclass, field
 
 import requests
-from github import Github, Auth, GithubException
-
-# 数据库验证库（可选）
-try:
-    import pymongo
-    PYMONGO_AVAILABLE = True
-except ImportError:
-    PYMONGO_AVAILABLE = False
-
-try:
-    import psycopg2
-    PSYCOPG2_AVAILABLE = True
-except ImportError:
-    PSYCOPG2_AVAILABLE = False
+from github import Github, Auth
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ========== Configuration ==========
 MAX_RUNTIME_SECONDS = 50 * 60
 HEARTBEAT_INTERVAL = 60
 REQUEST_TIMEOUT = 15
 PER_PAGE = 30
-SEARCH_WORKERS = 5
-VERIFY_WORKERS = 30
+SEARCH_WORKERS = 4
+VERIFY_WORKERS = 20
 BATCH_SIZE = 30
 BATCH_TIMEOUT = 60
 MAX_BACKOFF = 60
 DEEP_SCAN_MAX_FILES = 200
-
-# 缓存配置
-MAX_CACHE_SIZE = 200
+DEEP_SCAN_WORKER_ID = 99
+MAX_FILE_SIZE_BYTES = 500 * 1024
+MAX_COMMENTS_PER_ISSUE = 50
+MAX_CACHE_SIZE = 500
 MAX_CACHE_AGE = 3600
+FAKE_KEY_ENTROPY_THRESHOLD = 2.5   # empirically filters "xxx", "0000", "aaa" while keeping real keys (>3.0)
 
 APP_ID = os.environ.get("APP_ID")
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY")
@@ -74,97 +60,181 @@ BOT_SIGNATURE = f"*This message was sent by {BOT_NAME} - Repository: {REPO_NAME}
 
 GITHUB_API = "https://api.github.com"
 
-# 搜索条件
-ISSUE_QUERY = '"your key leak" OR "sk-" OR "sk-proj-" OR "xai-" OR "AIza" OR "sk-ant-api"'
-COMMIT_QUERY = 'sk- OR sk-proj- OR xai- OR AIza OR sk-ant-api'
-CODE_QUERY = 'sk- OR sk-proj- OR xai- OR AIza OR sk-ant-api'
+# Search queries
+CODE_QUERY = 'sk-proj- OR xai- OR AIza OR sk-ant-api OR r8_ OR hf_ OR tp-'
+ISSUE_QUERY = '"your key leak" OR "sk-proj-" OR "xai-" OR "AIza" OR "sk-ant-api"'
+COMMIT_QUERY = 'sk-proj- OR xai- OR AIza OR sk-ant-api'
 ENV_QUERY = 'filename:.env OR filename:.env.example OR filename:.env.local OR filename:.env.production OR filename:.env.staging OR filename:.env.dev OR filename:.env.test'
-
-STATE_FILE = "replied_state.json"
 
 start_time = time.time()
 last_heartbeat = start_time
 stop_event = Event()
-found_valid_keys: List[Tuple] = []
-valid_lock = Lock()
+shutdown_requested = False
 
-# pending 批次管理
-pending_batches: Dict[int, List[Tuple]] = defaultdict(list)
-pending_batch_times: Dict[int, float] = {}
-batch_locks: Dict[int, Lock] = {}
-pending_count: Dict[int, int] = defaultdict(int)
+# ========== LRU Cache with TTL ==========
+class LRUCache:
+    """Thread-safe LRU cache with TTL"""
+    def __init__(self, max_size: int = MAX_CACHE_SIZE, ttl: int = MAX_CACHE_AGE):
+        self.max_size = max_size
+        self.ttl = ttl
+        self.cache: Dict[str, Tuple[Any, float]] = {}
+        self.lock = RLock()
+    
+    def get(self, key: str) -> Optional[Any]:
+        with self.lock:
+            if key in self.cache:
+                value, timestamp = self.cache[key]
+                if time.time() - timestamp < self.ttl:
+                    del self.cache[key]
+                    self.cache[key] = (value, timestamp)
+                    return value
+                else:
+                    del self.cache[key]
+            return None
+    
+    def put(self, key: str, value: Any) -> None:
+        with self.lock:
+            if key in self.cache:
+                del self.cache[key]
+            elif len(self.cache) >= self.max_size:
+                oldest = next(iter(self.cache))
+                del self.cache[oldest]
+            self.cache[key] = (value, time.time())
+    
+    def clear(self) -> None:
+        with self.lock:
+            self.cache.clear()
 
-# 增强去重
-processed_keys: set = set()
-processed_sources: set = set()
-processed_key_source: set = set()
-processed_lock = Lock()
+file_cache = LRUCache()
+issue_cache = LRUCache()
+pr_cache = LRUCache()
+commit_cache = LRUCache()
+env_cache = LRUCache()
 
-# 已深度扫描的仓库
-scanned_repos: set = set()
+# ========== Deduplication ==========
+class BloomFilter:
+    def __init__(self, size: int = 100000, hash_count: int = 3):
+        self.size = size
+        self.hash_count = hash_count
+        self.bits = bytearray(size // 8 + 1)
+        self.lock = Lock()
+    
+    def _hashes(self, item: str) -> List[int]:
+        result = []
+        for i in range(self.hash_count):
+            h = hash(f"{item}_{i}")
+            result.append(h % self.size)
+        return result
+    
+    def add(self, item: str) -> None:
+        with self.lock:
+            for pos in self._hashes(item):
+                byte_idx = pos // 8
+                bit_idx = pos % 8
+                self.bits[byte_idx] |= (1 << bit_idx)
+    
+    def contains(self, item: str) -> bool:
+        with self.lock:
+            for pos in self._hashes(item):
+                byte_idx = pos // 8
+                bit_idx = pos % 8
+                if not (self.bits[byte_idx] & (1 << bit_idx)):
+                    return False
+        return True
+
+processed_exact: Set[str] = set()
+processed_exact_lock = Lock()
+bloom_filter = BloomFilter()
+scanned_repos: Set[str] = set()
 scanned_repos_lock = Lock()
 
-# 带时间戳的缓存
-file_content_cache: Dict[str, Tuple[str, float]] = {}
-issue_content_cache: Dict[str, Tuple[str, float]] = {}
-pr_content_cache: Dict[str, Tuple[str, float]] = {}
-commit_content_cache: Dict[str, Tuple[str, float]] = {}
-env_content_cache: Dict[str, Tuple[str, float]] = {}
-cache_lock = Lock()
+def is_duplicate(key: str, source_url: str) -> bool:
+    combo = f"{key}|{source_url}"
+    with processed_exact_lock:
+        if combo in processed_exact:
+            return True
+        processed_exact.add(combo)
+    bloom_filter.add(combo)
+    return False
 
-# 随机 User-Agent 池
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
-]
+def shannon_entropy(s: str) -> float:
+    """Calculate Shannon entropy of a string."""
+    if not s:
+        return 0.0
+    counter = Counter(s)
+    length = len(s)
+    entropy = 0.0
+    for count in counter.values():
+        prob = count / length
+        entropy -= prob * math.log2(prob)
+    return entropy
 
-def random_ua():
-    return random.choice(USER_AGENTS)
+def is_fake_key(key: str) -> bool:
+    """Return True if the key looks obviously fake (low entropy on random body)."""
+    # Strip known prefixes to compute entropy on the random body only
+    body = re.sub(
+        r'^(sk-proj-|sk-or-v1-|xai-|AIza|sk-ant-api|r8_|hf_|tp-|sk-api-|pplx-|github_pat_|ghp_|sk_live_|sk_test_|sk-)[-_]?',
+        '', key
+    )
+    if len(body) < 8:
+        return False
+    return shannon_entropy(body) < FAKE_KEY_ENTROPY_THRESHOLD
 
-# 缓存管理
-def clean_old_cache(cache_dict, max_size=MAX_CACHE_SIZE, max_age=MAX_CACHE_AGE):
-    now = time.time()
-    expired = [k for k, (_, ts) in cache_dict.items() if now - ts > max_age]
-    for k in expired:
-        del cache_dict[k]
-    if len(cache_dict) > max_size:
-        sorted_items = sorted(cache_dict.items(), key=lambda x: x[1][1])
-        for k, _ in sorted_items[:len(cache_dict) - max_size]:
-            del cache_dict[k]
-    return len(cache_dict)
+# ========== Batch Manager ==========
+@dataclass
+class BatchQueue:
+    items: List[Tuple] = field(default_factory=list)
+    count: int = 0
+    start_time: float = 0
+    lock: Lock = field(default_factory=Lock)
 
-def get_cached(cache_dict, key):
-    with cache_lock:
-        if key in cache_dict:
-            content, timestamp = cache_dict[key]
-            if time.time() - timestamp < MAX_CACHE_AGE:
-                return content
-            else:
-                del cache_dict[key]
-    return None
+class BatchManager:
+    def __init__(self, verify_func, batch_size: int = BATCH_SIZE, timeout: int = BATCH_TIMEOUT):
+        self.queues: Dict[int, BatchQueue] = defaultdict(BatchQueue)
+        self.verify_func = verify_func
+        self.batch_size = batch_size
+        self.timeout = timeout
+        self.global_lock = Lock()
+    
+    def _get_queue(self, worker_id: int) -> BatchQueue:
+        with self.global_lock:
+            return self.queues[worker_id]
+    
+    def add(self, worker_id, key, service, source_url, source_type, author, g):
+        queue = self._get_queue(worker_id)
+        with queue.lock:
+            if queue.count == 0:
+                queue.start_time = time.time()
+            queue.items.append((key, service, source_url, source_type, author))
+            queue.count += 1
+            should_verify = (queue.count >= self.batch_size) or (time.time() - queue.start_time >= self.timeout)
+            if should_verify:
+                batch = queue.items.copy()
+                queue.items.clear()
+                count = queue.count
+                queue.count = 0
+                self._submit_verify(worker_id, batch, g, count)
+    
+    def _submit_verify(self, worker_id, batch, g, batch_size):
+        import threading
+        thread = threading.Thread(target=self.verify_func, args=(worker_id, batch, g, batch_size))
+        thread.daemon = True
+        thread.start()
+    
+    def flush_all(self, g):
+        with self.global_lock:
+            for worker_id, queue in list(self.queues.items()):
+                with queue.lock:
+                    if queue.count > 0:
+                        self._submit_verify(worker_id, queue.items.copy(), g, queue.count)
+                        queue.items.clear()
+                        queue.count = 0
+    
+    def wait_for_completion(self, timeout: float = 30):
+        time.sleep(timeout)
 
-def set_cached(cache_dict, key, content):
-    with cache_lock:
-        cache_dict[key] = (content, time.time())
-        if len(cache_dict) > MAX_CACHE_SIZE + 50:
-            clean_old_cache(cache_dict)
-
-def print_cache_stats():
-    with cache_lock:
-        file_count = len(file_content_cache)
-        issue_count = len(issue_content_cache)
-        pr_count = len(pr_content_cache)
-        commit_count = len(commit_content_cache)
-        env_count = len(env_content_cache)
-        total = file_count + issue_count + pr_count + commit_count + env_count
-        print(f"Cache: files={file_count}, issues={issue_count}, PRs={pr_count}, commits={commit_count}, env={env_count}, total={total}")
-
-# ========== Key 正则（只保留可验证的，移除 Azure） ==========
+# ========== Key Patterns ==========
 KEY_PATTERNS = {
-    # AI Providers (可验证)
     "OpenAI": re.compile(r"sk-proj-[a-zA-Z0-9_\-]{50,}"),
     "OpenAI_Legacy": re.compile(r"sk-[a-zA-Z0-9]{32,}"),
     "OpenRouter": re.compile(r"sk-or-v1-[a-zA-Z0-9]{50,}"),
@@ -177,164 +247,50 @@ KEY_PATTERNS = {
     "MiMo": re.compile(r"tp-[a-zA-Z0-9]{10,}"),
     "MiniMax": re.compile(r"sk-api-[a-zA-Z0-9]{100,}"),
     "Perplexity": re.compile(r"pplx-[a-zA-Z0-9]{32,}"),
-    
-    # Cloud & Database (可验证)
     "GitHub_PAT": re.compile(r"github_pat_[a-zA-Z0-9_]{50,}"),
     "GitHub_Token": re.compile(r"ghp_[a-zA-Z0-9]{36}"),
     "Stripe_Live": re.compile(r"sk_live_[a-zA-Z0-9]{24,}"),
     "Stripe_Test": re.compile(r"sk_test_[a-zA-Z0-9]{24,}"),
-    "Twilio": re.compile(r"AC[a-zA-Z0-9]{32}"),
-    
-    # Database URIs (可尝试连接)
-    "MongoDB_URI": re.compile(r"mongodb(?:\+srv)?://[^:]+:[^@]+@[^/]+/[^?]+"),
-    "PostgreSQL_URI": re.compile(r"postgresql://[^:]+:[^@]+@[^/]+/[^?]+"),
 }
 
-# ========== 数据库验证函数（实际连接，短超时） ==========
-def _parse_mongodb_uri(code, data):
-    """验证 MongoDB URI 是否有效（实际连接测试）"""
-    if not PYMONGO_AVAILABLE:
-        return True, 0, "MongoDB URI (pymongo not installed, cannot verify)"
-    try:
-        # 使用更短的超时时间
-        client = pymongo.MongoClient(code, serverSelectionTimeoutMS=3000, connectTimeoutMS=3000)
-        client.admin.command('ping')
-        client.close()
-        return True, 0, "Valid MongoDB URI (connection successful)"
-    except Exception as e:
-        return True, 0, f"MongoDB URI (connection failed: {str(e)[:50]})"
+# ========== Verifiers ==========
+def _parse_stripe(code, data):
+    return (code == 200, 0, "Valid") if code == 200 else (False, 0, "Invalid") if code == 401 else (False, 0, f"HTTP {code}")
 
-def _parse_postgresql_uri(code, data):
-    """验证 PostgreSQL URI 是否有效（实际连接测试）"""
-    if not PSYCOPG2_AVAILABLE:
-        return True, 0, "PostgreSQL URI (psycopg2 not installed, cannot verify)"
-    try:
-        result = urllib.parse.urlparse(code)
-        dbname = result.path.lstrip('/') if result.path else 'postgres'
-        conn = psycopg2.connect(
-            host=result.hostname,
-            port=result.port or 5432,
-            user=result.username,
-            password=result.password,
-            database=dbname,
-            connect_timeout=3
-        )
-        conn.close()
-        return True, 0, "Valid PostgreSQL URI (connection successful)"
-    except Exception as e:
-        return True, 0, f"PostgreSQL URI (connection failed: {str(e)[:50]})"
-
-# ========== 验证函数 ==========
 def _parse_deepseek(code, data):
-    if code != 200:
-        return False, 0, f"HTTP {code}"
-    if not isinstance(data, dict):
-        return False, 0, "Invalid response"
-    if data.get("is_available", False):
-        cny = sum(float(i.get("total_balance", 0)) for i in data.get("balance_infos", []) if i.get("currency") == "CNY")
-        usd = sum(float(i.get("total_balance", 0)) for i in data.get("balance_infos", []) if i.get("currency") == "USD")
-        info = f"CNY: {cny:.2f}, USD: {usd:.2f}" if cny or usd else "Valid (no balance)"
-        return True, cny + usd * 7.2, info
-    return False, 0, "Invalid"
+    if code != 200 or not isinstance(data, dict) or not data.get("is_available"):
+        return False, 0, f"HTTP {code}" if code != 200 else "Invalid"
+    cny = sum(float(i.get("total_balance", 0)) for i in data.get("balance_infos", []) if i.get("currency") == "CNY")
+    usd = sum(float(i.get("total_balance", 0)) for i in data.get("balance_infos", []) if i.get("currency") == "USD")
+    info = f"CNY: {cny:.2f}, USD: {usd:.2f}" if cny or usd else "Valid (no balance)"
+    return True, cny + usd * 7.2, info
 
 def _parse_openai(code, data):
-    if code == 200:
-        return True, 0, "Valid"
-    if code == 401:
-        return False, 0, "Invalid"
-    if code == 429:
-        return True, 0, "Rate limited"
-    return False, 0, f"HTTP {code}"
+    return (True, 0, "Valid") if code == 200 else (False, 0, "Invalid") if code == 401 else (False, 0, f"HTTP {code}")
 
 def _parse_openrouter(code, data):
-    if code == 200:
-        credits = 0
-        if isinstance(data, dict):
-            credits = data.get("credits", 0)
-        info = f"Credits: {credits}" if credits > 0 else "Valid (no credits)"
+    if code == 200 and isinstance(data, dict):
+        credits = data.get("credits", 0)
+        info = f"Credits: {credits}" if credits > 0 else "Valid"
         return True, float(credits), info
     return False, 0, f"HTTP {code}"
 
 def _parse_xai(code, data):
-    if code == 200:
-        return True, 0, "Valid"
-    if code == 401:
-        return False, 0, "Invalid"
-    return False, 0, f"HTTP {code}"
+    return (True, 0, "Valid") if code == 200 else (False, 0, f"HTTP {code}")
 
 def _parse_gemini(code, data):
-    if code == 200:
-        return True, 0, "Valid"
-    if code == 403:
-        return True, 0, "Valid but restricted"
-    if code == 400:
-        if isinstance(data, dict) and "API key not valid" in str(data):
-            return False, 0, "Invalid key"
-        return True, 0, "Possibly valid"
-    if code == 429:
-        return True, 0, "Rate limited"
-    return False, 0, f"HTTP {code}"
+    return (True, 0, "Valid") if code == 200 else (True, 0, "Valid but restricted") if code == 403 else (False, 0, f"HTTP {code}")
 
 def _parse_anthropic(code, data):
-    if code == 200:
-        return True, 0, "Valid"
-    if code == 401:
-        return False, 0, "Invalid"
-    return False, 0, f"HTTP {code}"
+    return (True, 0, "Valid") if code == 200 else (False, 0, f"HTTP {code}")
 
 def _parse_github_token(code, data):
-    if code == 200:
-        return True, 0, "Valid GitHub token"
-    if code == 401:
-        return False, 0, "Invalid token"
-    return False, 0, f"HTTP {code}"
+    return (True, 0, "Valid") if code == 200 else (False, 0, "Invalid")
 
-def _parse_stripe(code, data):
-    # Stripe /v1/account 返回 200 表示 key 有效
-    if code == 200:
-        return True, 0, "Valid Stripe key"
-    if code == 401:
-        return False, 0, "Invalid key"
-    return False, 0, f"HTTP {code}"
-
-def _parse_twilio(code, data):
-    if code == 200:
-        return True, 0, "Valid Twilio key"
-    if code == 401:
-        return False, 0, "Invalid key"
-    return False, 0, f"HTTP {code}"
-
-def _parse_replicate(code, data):
-    if code == 200:
-        return True, 0, "Valid"
-    return False, 0, f"HTTP {code}"
-
-def _parse_huggingface(code, data):
-    if code == 200:
-        return True, 0, "Valid"
-    return False, 0, f"HTTP {code}"
-
-def _parse_mimo(code, data):
-    if code == 200:
-        balance = 0
-        if isinstance(data, dict):
-            balance = float(data.get("balance", data.get("credit", 0)))
-        info = f"Balance: {balance}" if balance > 0 else "Valid"
-        return True, balance, info
-    return False, 0, f"HTTP {code}"
-
-def _parse_minimax(code, data):
-    if code == 200:
-        return True, 0, "Valid"
-    return False, 0, f"HTTP {code}"
-
-def _parse_perplexity(code, data):
-    if code == 200:
-        return True, 0, "Valid"
-    return False, 0, f"HTTP {code}"
+def _parse_generic_token(code, data):
+    return (True, 0, "Valid") if code == 200 else (False, 0, f"HTTP {code}")
 
 VERIFIERS = {
-    # AI Providers
     "OpenAI": {"url": "https://api.openai.com/v1/models", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_openai},
     "OpenAI_Legacy": {"url": "https://api.openai.com/v1/models", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_openai},
     "OpenRouter": {"url": "https://openrouter.ai/api/v1/auth/key", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_openrouter},
@@ -342,26 +298,73 @@ VERIFIERS = {
     "DeepSeek": {"url": "https://api.deepseek.com/user/balance", "headers": lambda k: {"Authorization": f"Bearer {k}", "Accept": "application/json"}, "method": "GET", "parse": _parse_deepseek},
     "Gemini": {"url": lambda k: f"https://generativelanguage.googleapis.com/v1/models?key={k}", "headers": lambda k: {}, "method": "GET", "parse": _parse_gemini},
     "Anthropic": {"url": "https://api.anthropic.com/v1/messages", "headers": lambda k: {"x-api-key": k, "anthropic-version": "2023-06-01", "Content-Type": "application/json"}, "method": "POST", "body": lambda: json.dumps({"model": "claude-3-haiku-20240307", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}).encode(), "parse": _parse_anthropic},
-    "Replicate": {"url": "https://api.replicate.com/v1/account", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_replicate},
-    "HuggingFace": {"url": "https://huggingface.co/api/whoami", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_huggingface},
-    "MiMo": {"url": "https://token-plan-cn.xiaomimimo.com/v1/models", "headers": lambda k: {"Authorization": f"Bearer {k}", "X-Plan-Type": "token-plan"}, "method": "GET", "parse": _parse_mimo},
-    "MiniMax": {"url": "https://api.minimax.io/v1/models", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_minimax},
-    "Perplexity": {"url": "https://api.perplexity.ai/chat/completions", "headers": lambda k: {"Authorization": f"Bearer {k}", "Content-Type": "application/json"}, "method": "POST", "body": lambda: json.dumps({"model": "llama-3.1-sonar-small-128k-online", "messages": [{"role": "user", "content": "hi"}]}).encode(), "parse": _parse_perplexity},
-    
-    # Cloud & Database
+    "Replicate": {"url": "https://api.replicate.com/v1/account", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_generic_token},
+    "HuggingFace": {"url": "https://huggingface.co/api/whoami", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_generic_token},
+    "MiMo": {"url": "https://token-plan-cn.xiaomimimo.com/v1/models", "headers": lambda k: {"Authorization": f"Bearer {k}", "X-Plan-Type": "token-plan"}, "method": "GET", "parse": _parse_generic_token},
+    "MiniMax": {"url": "https://api.minimax.io/v1/models", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_generic_token},
+    "Perplexity": {"url": "https://api.perplexity.ai/chat/completions", "headers": lambda k: {"Authorization": f"Bearer {k}", "Content-Type": "application/json"}, "method": "POST", "body": lambda: json.dumps({"model": "llama-3.1-sonar-small-128k-online", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}).encode(), "parse": _parse_generic_token},
     "GitHub_PAT": {"url": "https://api.github.com/user", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_github_token},
     "GitHub_Token": {"url": "https://api.github.com/user", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_github_token},
     "Stripe_Live": {"url": "https://api.stripe.com/v1/account", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_stripe},
     "Stripe_Test": {"url": "https://api.stripe.com/v1/account", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_stripe},
-    "Twilio": {"url": "https://api.twilio.com/2010-04-01/Accounts", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_twilio},
-    
-    # Database URIs
-    "MongoDB_URI": {"url": lambda k: k, "headers": lambda k: {}, "method": "GET", "parse": _parse_mongodb_uri},
-    "PostgreSQL_URI": {"url": lambda k: k, "headers": lambda k: {}, "method": "GET", "parse": _parse_postgresql_uri},
 }
 
-# GitHub 认证
+# ========== HTTP Session ==========
+def create_session() -> requests.Session:
+    session = requests.Session()
+    retry = Retry(total=2, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+http_session = create_session()
+github_session = None
+found_valid_keys: List[Tuple] = []
+valid_lock = Lock()
+realtime_lock = Lock()
+batch_manager = None
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+]
+
+def random_ua():
+    return random.choice(USER_AGENTS)
+
+def check_timeout_and_exit():
+    if time.time() - start_time >= MAX_RUNTIME_SECONDS:
+        if not shutdown_requested:
+            print(f"\nMax runtime reached ({MAX_RUNTIME_SECONDS}s). Shutting down...")
+            graceful_shutdown()
+
+def graceful_shutdown():
+    global shutdown_requested
+    if shutdown_requested:
+        return
+    shutdown_requested = True
+    print("\n[!] Graceful shutdown initiated...")
+    stop_event.set()
+    if batch_manager:
+        print("[!] Flushing pending batches...")
+        batch_manager.flush_all(github_session)
+        batch_manager.wait_for_completion(timeout=30)
+    print("[!] Saving results...")
+    save_final_results()
+    print("[!] Shutdown complete.")
+
+def signal_handler(sig, frame):
+    graceful_shutdown()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
 def get_github_client():
+    global github_session
+    if github_session:
+        return github_session
     token = None
     if APP_ID and PRIVATE_KEY and INSTALLATION_ID:
         try:
@@ -382,71 +385,8 @@ def get_github_client():
         print("No authentication method available")
         return None
     auth = Auth.Token(token)
-    return Github(auth=auth, retry=0)
-
-# 工具函数
-def _gh_headers():
-    headers = {"Accept": "application/vnd.github+json", "User-Agent": random_ua()}
-    if PAT_TOKEN:
-        headers["Authorization"] = f"Bearer {PAT_TOKEN}"
-    return headers
-
-def _http_request(url, headers, method="GET", body=None, timeout=REQUEST_TIMEOUT):
-    try:
-        req = urllib.request.Request(url, headers=headers, method=method, data=body)
-        ctx = ssl.create_default_context()
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-            raw = resp.read().decode("utf-8")
-            try:
-                return resp.status, json.loads(raw)
-            except:
-                return resp.status, raw
-    except urllib.error.HTTPError as e:
-        return e.code, str(e)
-    except:
-        return 0, str(e)
-
-def safe_print(msg):
-    with print_lock:
-        print(msg, flush=True)
-
-print_lock = Lock()
-
-def safe_sleep(seconds):
-    actual_sleep = min(seconds, MAX_BACKOFF)
-    elapsed = 0
-    while elapsed < actual_sleep and not stop_event.is_set():
-        check_timeout()
-        time.sleep(min(0.5, actual_sleep - elapsed))
-        elapsed += 0.5
-
-def check_timeout():
-    elapsed = time.time() - start_time
-    if elapsed >= MAX_RUNTIME_SECONDS:
-        print(f"\nMax runtime reached ({MAX_RUNTIME_SECONDS}s / 50 min). Exiting.")
-        save_final_results()
-        sys.exit(0)
-    return elapsed
-
-def heartbeat():
-    global last_heartbeat
-    now = time.time()
-    if now - last_heartbeat >= HEARTBEAT_INTERVAL:
-        elapsed = now - start_time
-        remaining = MAX_RUNTIME_SECONDS - elapsed
-        print(f"Alive: {elapsed:.0f}s / {MAX_RUNTIME_SECONDS}s (remaining: {remaining:.0f}s)")
-        print_cache_stats()
-        last_heartbeat = now
-
-def signal_handler(sig, frame):
-    print("\nInterrupted, saving results...")
-    stop_event.set()
-    safe_sleep(2)
-    save_final_results()
-    sys.exit(0)
-
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
+    github_session = Github(auth=auth, retry=0)
+    return github_session
 
 def save_final_results():
     with valid_lock:
@@ -458,22 +398,20 @@ def save_final_results():
                 for key, service, balance, info, source_url, source_type, _ in found_valid_keys:
                     f.write(f"{service} | {key} | {info} | {source_url}\n")
             print(f"\nSaved {len(found_valid_keys)} keys to valid_keys_final_{timestamp}.txt")
+            return True
+    return False
 
-# 回复模板
 def build_reply(author, service, key, info, source_url, source_type, balance=None, is_fallback=False):
-    masked = key[:12] + "..." + key[-8:] if len(key) > 24 else key
-    balance_text = f" (Balance: {balance})" if balance is not None and balance > 0 else ""
-    
-    install_note = ""
-    if is_fallback:
-        install_note = f"""
-
----
-To receive notifications directly in your repository, install this bot:
-https://github.com/apps/llmapicheckbot2
-"""
-    
-    return f"""API Key Leak Detected!
+    # Mask key preview based on length (no DB URI handling needed)
+    if len(key) > 24:
+        masked = key[:12] + "..." + key[-8:]
+    elif len(key) > 16:
+        masked = key[:8] + "..." + key[-6:]
+    else:
+        masked = key[:4] + "..." + key[-4:]
+    balance_text = f" (Balance: {balance})" if balance else ""
+    install_note = "\n\n---\n📌 To receive notifications directly, install: https://github.com/apps/llmapicheckbot2" if is_fallback else ""
+    return f"""🔴 API Key Leak Detected!
 
 @{author} Your API key has been exposed in this {source_type}{balance_text}.
 
@@ -481,279 +419,114 @@ Service: {service}
 Key preview: {masked}
 Status: {info}
 
-Immediate Actions Required:
-1. Revoke this key immediately from your {service} dashboard
-2. Generate a new key
-3. Remove the exposed key from the {source_type}
-4. Rotate any other secrets that may be compromised
-
 Source: {source_url}
 
 ---
 {BOT_SIGNATURE}{install_note}"""
 
-# 获取完整内容函数
 def get_full_file_content(source_url):
-    cache_key = source_url.split("/blob/")[0] + source_url.split("/blob/")[1] if "/blob/" in source_url else source_url
-    
-    cached = get_cached(file_content_cache, cache_key)
-    if cached is not None:
+    cached = file_cache.get(source_url)
+    if cached:
         return cached
-    
-    raw_url = source_url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
     try:
-        headers = {"User-Agent": random_ua()}
-        resp = requests.get(raw_url, headers=headers, timeout=10)
-        if resp.status_code == 200:
-            content = resp.text
-            set_cached(file_content_cache, cache_key, content)
-            print(f"    Fetched full file: {source_url[:80]}...")
-            return content
-    except Exception as e:
-        print(f"    Failed to fetch file: {e}")
-    return None
-
-def get_full_env_content(source_url):
-    cache_key = source_url
-    
-    cached = get_cached(env_content_cache, cache_key)
-    if cached is not None:
-        return cached
-    
-    raw_url = source_url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
-    try:
-        headers = {"User-Agent": random_ua()}
-        resp = requests.get(raw_url, headers=headers, timeout=10)
-        if resp.status_code == 200:
-            content = resp.text
-            set_cached(env_content_cache, cache_key, content)
-            print(f"    Fetched .env file: {source_url[:80]}...")
-            return content
-    except Exception as e:
-        print(f"    Failed to fetch .env file: {e}")
-    return None
-
-def get_full_issue_content(g, source_url):
-    cached = get_cached(issue_content_cache, source_url)
-    if cached is not None:
-        return cached
-    
-    try:
-        parts = source_url.replace("https://github.com/", "").split("/issues/")
+        parts = source_url.replace("https://github.com/", "").split("/blob/")
         if len(parts) != 2:
             return None
         repo_path = parts[0]
-        issue_num = int(parts[1])
-        
-        repo = g.get_repo(repo_path)
-        issue = repo.get_issue(number=issue_num)
-        
-        content = f"# {issue.title}\n\n{issue.body or ''}\n\n"
-        
-        comments = issue.get_comments()
-        for i, comment in enumerate(comments):
-            content += f"\n## Comment by {comment.user.login}\n{comment.body or ''}\n"
-        
-        set_cached(issue_content_cache, source_url, content)
-        print(f"    Fetched full issue #{issue_num} with {comments.totalCount} comments")
-        return content
-    except Exception as e:
-        print(f"    Failed to fetch issue: {e}")
+        branch_and_path = parts[1]
+        branch_parts = branch_and_path.split("/", 1)
+        branch = branch_parts[0]
+        file_path = urllib.parse.quote(branch_parts[1], safe='/') if len(branch_parts) > 1 else ""
+        raw_url = f"https://raw.githubusercontent.com/{repo_path}/{branch}/{file_path}"
+    except Exception:
         return None
-
-def get_full_pr_content(g, source_url):
-    cached = get_cached(pr_content_cache, source_url)
-    if cached is not None:
-        return cached
-    
     try:
-        parts = source_url.replace("https://github.com/", "").split("/pull/")
+        resp = http_session.get(raw_url, timeout=10, stream=True)
+        if resp.status_code == 200:
+            chunks = []
+            size = 0
+            for chunk in resp.iter_content(chunk_size=16384):
+                chunks.append(chunk.decode('utf-8', errors='replace'))
+                size += len(chunks[-1])
+                if size > MAX_FILE_SIZE_BYTES:
+                    chunks.append("\n...[File truncated]")
+                    break
+            content = "".join(chunks)
+            file_cache.put(source_url, content)
+            return content
+    except Exception:
+        pass
+    return None
+
+def get_issue_or_pr_content(source_url, g):
+    cache = pr_cache if "/pull/" in source_url else issue_cache
+    cached = cache.get(source_url)
+    if cached:
+        return cached
+    try:
+        if "/pull/" in source_url:
+            parts = source_url.replace("https://github.com/", "").split("/pull/")
+        else:
+            parts = source_url.replace("https://github.com/", "").split("/issues/")
         if len(parts) != 2:
-            return None
+            return ""
         repo_path = parts[0]
-        pr_num = int(parts[1])
-        
+        number = int(parts[1].split("#")[0])
         repo = g.get_repo(repo_path)
-        pr = repo.get_pull(number=pr_num)
-        
-        content = f"# {pr.title}\n\n{pr.body or ''}\n\n"
-        
-        comments = pr.get_issue_comments()
-        for comment in comments:
-            content += f"\n## Comment by {comment.user.login}\n{comment.body or ''}\n"
-        
-        review_comments = pr.get_review_comments()
-        for rc in review_comments:
-            content += f"\n## Review Comment by {rc.user.login}\n{rc.body or ''}\n"
-        
-        diff_url = f"https://patch-diff.githubusercontent.com/raw/{repo_path}/pull/{pr_num}.diff"
-        headers = {"User-Agent": random_ua()}
-        try:
-            resp = requests.get(diff_url, headers=headers, timeout=10)
-            if resp.status_code == 200:
-                content += f"\n## Diff\n{resp.text}\n"
-        except:
-            pass
-        
-        set_cached(pr_content_cache, source_url, content)
-        print(f"    Fetched full PR #{pr_num}")
+        item = repo.get_issue(number=number)
+        content = f"{item.title}\n{item.body or ''}"
+        cache.put(source_url, content)
         return content
     except Exception as e:
-        print(f"    Failed to fetch PR: {e}")
-        return None
+        print(f"  ⚠️ Error fetching issue/PR content: {e}")
+        return ""
 
-def get_full_commit_content(g, source_url):
-    cached = get_cached(commit_content_cache, source_url)
-    if cached is not None:
+def get_commit_content(source_url, g):
+    cached = commit_cache.get(source_url)
+    if cached:
         return cached
-    
     try:
         parts = source_url.replace("https://github.com/", "").split("/commit/")
         if len(parts) != 2:
-            return None
-        repo_path = parts[0]
-        commit_sha = parts[1]
-        
-        repo = g.get_repo(repo_path)
-        commit = repo.get_commit(sha=commit_sha)
-        
-        content = f"# {commit.commit.message}\n\n"
-        
-        files = commit.files
-        for f in files:
-            content += f"\n## {f.filename}\n"
-            if f.patch:
-                content += f"{f.patch}\n"
-        
-        set_cached(commit_content_cache, source_url, content)
-        print(f"    Fetched full commit {commit_sha[:8]}")
-        return content
+            return ""
+        sha = parts[1].split("#")[0]
+        diff_url = f"https://github.com/{parts[0]}/commit/{sha}.diff"
+        headers = _gh_headers()
+        resp = http_session.get(diff_url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            content = resp.text
+            commit_cache.put(source_url, content)
+            return content
+        else:
+            print(f"  ⚠️ Could not fetch diff (HTTP {resp.status_code}) for {source_url}")
+            return ""
     except Exception as e:
-        print(f"    Failed to fetch commit: {e}")
-        return None
+        print(f"  ⚠️ Error fetching commit diff: {e}")
+        return ""
 
-# 深度扫描整个仓库
-def deep_scan_repository(g, repo_full_name):
-    with scanned_repos_lock:
-        if repo_full_name in scanned_repos:
-            return 0
-        scanned_repos.add(repo_full_name)
-    
-    safe_print(f"\n🔍 Deep scanning repository: {repo_full_name}")
-    
-    try:
-        repo = g.get_repo(repo_full_name)
-    except Exception as e:
-        safe_print(f"  ❌ Cannot access repo: {e}")
-        return 0
-    
-    found_count = 0
-    branch = repo.default_branch
-    
-    try:
-        commit = repo.get_commit(sha=branch)
-        tree = commit.get_tree(recursive=True)
-        
-        files_scanned = 0
-        for item in tree.tree:
-            if files_scanned >= DEEP_SCAN_MAX_FILES:
-                safe_print(f"  ⏸️ Reached max files ({DEEP_SCAN_MAX_FILES}), stopping deep scan")
-                break
-            
-            if item.type != "blob":
+def extract_and_queue(text, source_url, source_type, worker_id, author, g):
+    full_text = text
+    if source_type in ("code", "env") and "/blob/" in source_url:
+        content = get_full_file_content(source_url)
+        if content:
+            full_text = content
+    elif source_type in ("issue", "pr"):
+        full_text = get_issue_or_pr_content(source_url, g)
+    elif source_type == "commit":
+        full_text = get_commit_content(source_url, g)
+    else:
+        return
+    if not full_text:
+        return
+    for service, pattern in KEY_PATTERNS.items():
+        for match in pattern.finditer(full_text):
+            key = match.group(0)
+            if is_fake_key(key):
                 continue
-            
-            file_path = item.path
-            if not any(ext in file_path.lower() for ext in ['.env', '.json', '.yaml', '.yml', '.toml', '.txt', '.md', '.cfg', '.conf', 'config', '.ini', '.properties']):
+            if is_duplicate(key, source_url):
                 continue
-            
-            files_scanned += 1
-            safe_print(f"    📄 Scanning: {file_path}")
-            
-            try:
-                raw_url = f"https://raw.githubusercontent.com/{repo_full_name}/{branch}/{file_path}"
-                headers = {"User-Agent": random_ua()}
-                resp = requests.get(raw_url, headers=headers, timeout=10)
-                if resp.status_code == 200:
-                    content = resp.text
-                    for service, pattern in KEY_PATTERNS.items():
-                        for match in pattern.finditer(content):
-                            key = match.group(0)
-                            safe_print(f"      🔑 Found {service} key in deep scan: {file_path}")
-                            add_key_to_pending(1, key, service, item.url, "deep_scan", repo.owner.login, g)
-                            found_count += 1
-            except Exception as e:
-                safe_print(f"      ⚠️ Error fetching {file_path}: {e}")
-                
-    except Exception as e:
-        safe_print(f"  ❌ Deep scan failed: {e}")
-    
-    safe_print(f"  ✅ Deep scan completed: found {found_count} new keys")
-    return found_count
-
-def is_duplicate(key, source_url):
-    with processed_lock:
-        if key in processed_keys:
-            return True
-        if source_url in processed_sources:
-            return True
-        combo = f"{key}|{source_url}"
-        if combo in processed_key_source:
-            return True
-    return False
-
-def mark_processed(key, source_url):
-    with processed_lock:
-        processed_keys.add(key)
-        processed_sources.add(source_url)
-        processed_key_source.add(f"{key}|{source_url}")
-
-def reply_to_original_issue_or_pr(g, source_url, author, service, key, info, balance):
-    try:
-        if "/issues/" in source_url:
-            parts = source_url.replace("https://github.com/", "").split("/issues/")
-            is_pr = False
-        elif "/pull/" in source_url:
-            parts = source_url.replace("https://github.com/", "").split("/pull/")
-            is_pr = True
-        else:
-            return False
-        
-        if len(parts) != 2:
-            return False
-        
-        repo_path = parts[0]
-        item_num = int(parts[1])
-        repo = g.get_repo(repo_path)
-        
-        if is_pr:
-            item = repo.get_pull(number=item_num)
-            comment_func = item.create_issue_comment
-            item_type = "PR"
-        else:
-            item = repo.get_issue(number=item_num)
-            comment_func = item.create_comment
-            item_type = "Issue"
-        
-        bot_login = g.get_user().login
-        if is_pr:
-            comments = item.get_issue_comments()
-        else:
-            comments = item.get_comments()
-        
-        for comment in comments:
-            if comment.user.login == bot_login and "API Key Leak Detected" in comment.body:
-                print(f"    Already replied to {item_type} #{item_num} in {repo_path}")
-                return True
-        
-        message = build_reply(author, service, key, info, source_url, item_type.lower(), balance, is_fallback=False)
-        comment_func(message)
-        print(f"    Replied to {item_type} #{item_num} in {repo_path}")
-        return True
-        
-    except Exception as e:
-        print(f"    Failed to reply: {e}")
-        return False
+            print(f"  🔑 Found {service} key: {source_url[:80]}...")
+            batch_manager.add(worker_id, key, service, source_url, source_type, author, g)
 
 def create_issue_in_original_repo(g, source_url, author, service, key, info, balance):
     if "/blob/" not in source_url:
@@ -765,86 +538,36 @@ def create_issue_in_original_repo(g, source_url, author, service, key, info, bal
         repo_path = parts[0]
         file_path = parts[1]
         repo = g.get_repo(repo_path)
-
-        already_exists = False
         try:
-            issues = repo.get_issues(state="all")
-            if issues is not None:
-                for issue in issues:
-                    if file_path in issue.title or source_url in issue.body:
-                        already_exists = True
-                        print(f"    Issue already exists for {file_path} in {repo_path}")
-                        break
-        except Exception as e:
-            print(f"    Could not check existing issues: {e}")
-
-        if already_exists:
-            return True
-
-        message = build_reply(author, service, key, info, source_url, "code file", balance, is_fallback=False)
+            issues = repo.get_issues(state="open", labels=["security"])[:30]
+            for issue in issues:
+                if file_path in issue.title or source_url in issue.body:
+                    return True
+        except:
+            pass
+        message = build_reply(author, service, key, info, source_url, "code file", balance)
         issue_title = f"API Key Leak Detected in {file_path}"
         issue_body = message + f"\n\nFile: {file_path}"
-        
         try:
-            new_issue = repo.create_issue(title=issue_title, body=issue_body, labels=["security"])
-            print(f"    Created issue in {repo_path} for file {file_path} (with labels)")
+            repo.create_issue(title=issue_title, body=issue_body, labels=["security"])
+            print(f"    📝 Created issue in {repo_path}")
             return True
         except Exception as e:
-            if "labels" in str(e).lower() or "permission" in str(e).lower():
-                print(f"    Cannot create labels in {repo_path}, retrying without labels...")
-                try:
-                    new_issue = repo.create_issue(title=issue_title, body=issue_body)
-                    print(f"    Created issue in {repo_path} for file {file_path} (without labels)")
-                    return True
-                except Exception as e2:
-                    print(f"    Failed to create issue even without labels: {e2}")
-                    return False
-            else:
-                print(f"    Failed to create issue: {e}")
-                return False
-    except Exception as e:
-        print(f"    Failed to create issue in original repo: {e}")
+            if "labels" in str(e).lower():
+                repo.create_issue(title=issue_title, body=issue_body)
+                return True
+            return False
+    except Exception:
         return False
 
 def create_issue_in_my_repo(g, key, service, info, source_url, source_type, author, balance, is_fallback=False):
-    message = build_reply(author, service, key, info, source_url, source_type, balance, is_fallback=is_fallback)
-
+    message = build_reply(author, service, key, info, source_url, source_type, balance, is_fallback)
     try:
         my_repo = g.get_repo(REPO_NAME)
-
-        already_exists = False
-        existing_issue_num = None
-        try:
-            issues = my_repo.get_issues(state="all")
-            if issues is not None:
-                for issue in issues:
-                    if source_url in issue.body:
-                        already_exists = True
-                        existing_issue_num = issue.number
-                        break
-        except Exception as e:
-            print(f"    Failed to check existing issues: {e}")
-
-        if already_exists:
-            print(f"    Issue #{existing_issue_num} already exists for this source, skipping")
-            return
-
-        short_url = source_url.replace("https://github.com/", "")
-        if len(short_url) > 60:
-            short_url = short_url[:57] + "..."
-
-        if "/pull/" in source_url:
-            display_type = "Pull Request"
-        elif "/issues/" in source_url:
-            display_type = "Issue"
-        elif "/commit/" in source_url:
-            display_type = "Commit"
-        else:
-            display_type = source_type
-
-        fallback_note = " (fallback because original notification failed)" if is_fallback else ""
+        short_url = source_url.replace("https://github.com/", "")[:57] + "..."
+        display_type = "Pull Request" if "/pull/" in source_url else "Issue" if "/issues/" in source_url else "Commit" if "/commit/" in source_url else source_type
         issue_title = f"{service} Key Leak in {display_type}: {short_url}"
-        issue_body = f"""## API Key Leak Detected{fallback_note}
+        issue_body = f"""## API Key Leak Detected{' (fallback)' if is_fallback else ''}
 
 | Field | Value |
 |-------|-------|
@@ -858,78 +581,77 @@ def create_issue_in_my_repo(g, key, service, info, source_url, source_type, auth
 
 ---
 
-### Details
-
 {message}
 
 ---
-
 Auto-generated by {BOT_NAME}
 """
         try:
             new_issue = my_repo.create_issue(title=issue_title, body=issue_body, labels=["security", "leak"])
-            print(f"    Created issue #{new_issue.number} in {REPO_NAME} (with labels)")
-        except Exception as e:
-            if "labels" in str(e).lower() or "permission" in str(e).lower():
-                print(f"    Cannot create labels in {REPO_NAME}, retrying without labels...")
-                new_issue = my_repo.create_issue(title=issue_title, body=issue_body)
-                print(f"    Created issue #{new_issue.number} in {REPO_NAME} (without labels)")
-            else:
-                raise
+            print(f"    📝 Created issue #{new_issue.number}")
+        except:
+            new_issue = my_repo.create_issue(title=issue_title, body=issue_body)
+            print(f"    📝 Created issue #{new_issue.number} (no labels)")
     except Exception as e:
-        print(f"    Failed to create issue in my repo: {e}")
+        print(f"    ❌ Failed: {e}")
+
+def reply_to_original_issue_or_pr(g, source_url, author, service, key, info, balance):
+    try:
+        if "/issues/" in source_url:
+            parts = source_url.replace("https://github.com/", "").split("/issues/")
+            is_pr = False
+        elif "/pull/" in source_url:
+            parts = source_url.replace("https://github.com/", "").split("/pull/")
+            is_pr = True
+        else:
+            return False
+        if len(parts) != 2:
+            return False
+        repo_path = parts[0]
+        item_num = int(parts[1].split("#")[0])
+        repo = g.get_repo(repo_path)
+        if is_pr:
+            item = repo.get_pull(number=item_num)
+            comment_func = item.create_issue_comment
+            item_type = "PR"
+            comments = item.get_issue_comments()[:MAX_COMMENTS_PER_ISSUE]
+        else:
+            item = repo.get_issue(number=item_num)
+            comment_func = item.create_comment
+            item_type = "Issue"
+            comments = item.get_comments()[:MAX_COMMENTS_PER_ISSUE]
+        bot_login = g.get_user().login
+        for comment in comments:
+            if comment.user.login == bot_login and "API Key Leak Detected" in comment.body:
+                print(f"    Already replied to {item_type} #{item_num}")
+                return True
+        message = build_reply(author, service, key, info, source_url, item_type.lower(), balance)
+        comment_func(message)
+        print(f"    📝 Replied to {item_type} #{item_num}")
+        return True
+    except Exception as e:
+        print(f"    ❌ Failed: {e}")
+        return False
 
 def handle_leak(g, key, service, info, source_url, source_type, author, balance):
-    # 触发深度扫描（仅当不是深度扫描本身）
-    if source_type != "deep_scan":
-        repo_name = "/".join(source_url.split("/")[3:5]) if "github.com" in source_url else None
-        if repo_name:
-            with scanned_repos_lock:
-                if repo_name not in scanned_repos:
-                    scanned_repos.add(repo_name)
-                    executor = ThreadPoolExecutor(max_workers=1)
-                    # 修复：只传 2 个参数
-                    executor.submit(deep_scan_repository, g, repo_name)
-                    executor.shutdown(wait=False)
-    
-    # 去重检查
-    if is_duplicate(key, source_url):
-        print(f"    Skipping duplicate in handle_leak")
-        return
-    
-    mark_processed(key, source_url)
-    
     if "/issues/" in source_url or "/pull/" in source_url:
-        original_success = reply_to_original_issue_or_pr(g, source_url, author, service, key, info, balance)
-        create_issue_in_my_repo(g, key, service, info, source_url, source_type, author, balance, is_fallback=not original_success)
-    
+        success = reply_to_original_issue_or_pr(g, source_url, author, service, key, info, balance)
+        create_issue_in_my_repo(g, key, service, info, source_url, source_type, author, balance, is_fallback=not success)
     elif "/blob/" in source_url:
-        original_success = create_issue_in_original_repo(g, source_url, author, service, key, info, balance)
-        create_issue_in_my_repo(g, key, service, info, source_url, source_type, author, balance, is_fallback=not original_success)
-    
-    elif "/commit/" in source_url:
-        create_issue_in_my_repo(g, key, service, info, source_url, source_type, author, balance, is_fallback=False)
-        print(f"    Commit source, only created issue in fallback repo")
-    
+        success = create_issue_in_original_repo(g, source_url, author, service, key, info, balance)
+        create_issue_in_my_repo(g, key, service, info, source_url, source_type, author, balance, is_fallback=not success)
     else:
         create_issue_in_my_repo(g, key, service, info, source_url, source_type, author, balance, is_fallback=False)
-        print(f"    Unknown source type, only created issue in fallback repo")
 
-def verify_batch(worker_id, batch, g):
+def verify_batch(worker_id, batch, g, batch_size):
     if not batch:
         return
-    
-    is_timeout_trigger = len(batch) < BATCH_SIZE
-    if is_timeout_trigger:
-        safe_print(f"\n[Worker-{worker_id}] Verifying timeout batch: {len(batch)} keys (triggered by {BATCH_TIMEOUT}s timeout)")
-    else:
-        safe_print(f"\n[Worker-{worker_id}] Verifying full batch: {len(batch)} keys")
-
-    def verify_one(key_info):
-        key, service, source_url, source_type, author = key_info
+    print(f"\n[Worker-{worker_id}] 🔍 Verifying {len(batch)} keys{' (timeout)' if batch_size < BATCH_SIZE else ''}")
+    results = []
+    for key, service, source_url, source_type, author in batch:
         verifier = VERIFIERS.get(service)
         if not verifier:
-            return (key, service, False, 0, "Unsupported", source_url, source_type, author)
+            continue
         try:
             url = verifier["url"](key) if callable(verifier["url"]) else verifier["url"]
             headers = verifier["headers"](key)
@@ -937,388 +659,297 @@ def verify_batch(worker_id, batch, g):
             body = verifier.get("body")
             if body:
                 body = body()
-            if verifier["method"] == "GET":
-                resp = requests.get(url, headers=headers, timeout=8)
-            else:
-                resp = requests.post(url, headers=headers, data=body, timeout=8)
+            resp = http_session.get(url, headers=headers, timeout=8) if verifier["method"] == "GET" else http_session.post(url, headers=headers, data=body, timeout=8)
             valid, balance, info = verifier["parse"](resp.status_code, resp.json() if resp.text else None)
-            return (key, service, valid, balance, info, source_url, source_type, author)
+            if valid:
+                results.append((key, service, valid, balance, info, source_url, source_type, author))
+                print(f"  ✅ [{service}] {key[:25]}... -> {info}")
+                print(f"     📍 Source: {source_url}")
+            else:
+                print(f"  ❌ [{service}] {key[:25]}... -> {info}")
         except Exception as e:
-            return (key, service, False, 0, f"Error: {str(e)[:30]}", source_url, source_type, author)
+            print(f"  ❌ [{service}] {key[:25]}... -> Error: {str(e)[:30]}")
+    for key, service, valid, balance, info, source_url, source_type, author in results:
+        with valid_lock:
+            found_valid_keys.append((key, service, balance, info, source_url, source_type, datetime.now()))
+        with realtime_lock:
+            with open("valid_keys_realtime.txt", "a") as f:
+                f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | {service} | {key} | {info} | {source_url}\n")
+        handle_leak(g, key, service, info, source_url, source_type, author, balance)
 
-    with ThreadPoolExecutor(max_workers=VERIFY_WORKERS) as executor:
-        futures = [executor.submit(verify_one, ki) for ki in batch]
-        valid_count = 0
-        invalid_count = 0
-        for future in as_completed(futures):
+def deep_scan_repository(g, repo_full_name):
+    with scanned_repos_lock:
+        if repo_full_name in scanned_repos:
+            return 0
+        scanned_repos.add(repo_full_name)
+    print(f"\n🔍 Deep scanning: {repo_full_name}")
+    try:
+        repo = g.get_repo(repo_full_name)
+    except Exception as e:
+        print(f"  ❌ Cannot access: {e}")
+        return 0
+    found_count = 0
+    branch = repo.default_branch
+    # Safe author extraction (handles organizations / deleted repos)
+    author = getattr(repo.owner, 'login', None) or "unknown"
+    try:
+        commit = repo.get_commit(sha=branch)
+        tree = commit.get_tree(recursive=True)
+        if hasattr(tree, 'truncated') and tree.truncated:
+            print(f"  ⚠️ Tree truncated, may miss files")
+        files_scanned = 0
+        for item in tree.tree:
+            if files_scanned >= DEEP_SCAN_MAX_FILES:
+                break
+            if item.type != "blob":
+                continue
+            file_path = item.path
+            extensions = ['.env', '.json', '.yaml', '.yml', '.toml', '.txt', '.md', '.cfg', '.conf',
+                          '.config', '.ini', '.properties', '.py', '.js', '.ts', '.java', '.go', '.rs', '.rb', '.php']
+            if not any(file_path.lower().endswith(ext) for ext in extensions):
+                continue
+            files_scanned += 1
+            print(f"    📄 Scanning: {file_path}")
             try:
-                key, service, valid, balance, info, source_url, source_type, author = future.result(timeout=15)
-                if valid:
-                    valid_count += 1
-                    print(f"  ✅ [{service}] {key[:25]}... -> {info}")
-                    print(f"     📍 Source: {source_url}")
-
-                    with valid_lock:
-                        found_valid_keys.append((key, service, balance, info, source_url, source_type, datetime.now()))
-                    with open("valid_keys_realtime.txt", "a") as f:
-                        f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | {service} | {key} | {info} | {source_url}\n")
-
-                    handle_leak(g, key, service, info, source_url, source_type, author, balance)
-                else:
-                    invalid_count += 1
-                    print(f"  ❌ [{service}] {key[:25]}... -> {info}")
-                    print(f"     📍 Source: {source_url}")
+                encoded_path = urllib.parse.quote(file_path, safe='/')
+                encoded_branch = urllib.parse.quote(branch, safe='/')
+                html_url = f"https://github.com/{repo_full_name}/blob/{encoded_branch}/{encoded_path}"
+                raw_url = f"https://raw.githubusercontent.com/{repo_full_name}/{encoded_branch}/{encoded_path}"
+                resp = http_session.get(raw_url, timeout=10, stream=True)
+                if resp.status_code == 200:
+                    chunks = []
+                    size = 0
+                    for chunk in resp.iter_content(chunk_size=16384):
+                        chunks.append(chunk.decode('utf-8', errors='replace'))
+                        size += len(chunks[-1])
+                        if size > MAX_FILE_SIZE_BYTES:
+                            chunks.append("\n...[File truncated]")
+                            break
+                    content = "".join(chunks)
+                    for service, pattern in KEY_PATTERNS.items():
+                        for match in pattern.finditer(content):
+                            key = match.group(0)
+                            if is_fake_key(key):
+                                continue
+                            if is_duplicate(key, html_url):
+                                continue
+                            print(f"      🔑 Found {service} key")
+                            batch_manager.add(DEEP_SCAN_WORKER_ID, key, service, html_url, "deep_scan", author, g)
+                            found_count += 1
             except Exception as e:
-                invalid_count += 1
-                print(f"  ❌ Exception: {e}")
-        
-        if is_timeout_trigger:
-            safe_print(f"[Worker-{worker_id}] 📊 Timeout batch completed: {valid_count} valid, {invalid_count} invalid (total {len(batch)})")
-        else:
-            safe_print(f"[Worker-{worker_id}] 📊 Batch completed: {valid_count}/{len(batch)} valid keys")
+                print(f"      ⚠️ Error: {e}")
+    except Exception as e:
+        print(f"  ❌ Deep scan failed: {e}")
+    print(f"  ✅ Deep scan completed: found {found_count} keys")
+    return found_count
 
-def check_pending_timeout(worker_id, g):
-    with batch_locks.get(worker_id, Lock()):
-        if pending_count.get(worker_id, 0) > 0:
-            elapsed = time.time() - pending_batch_times.get(worker_id, start_time)
-            if elapsed >= BATCH_TIMEOUT:
-                batch = pending_batches[worker_id].copy()
-                pending_batches[worker_id].clear()
-                count = pending_count[worker_id]
-                pending_count[worker_id] = 0
-                if worker_id in pending_batch_times:
-                    del pending_batch_times[worker_id]
-                
-                safe_print(f"[Worker-{worker_id}] ⏰ Triggering verification by timeout ({elapsed:.0f}s, {count} keys)")
-                executor = ThreadPoolExecutor(max_workers=1)
-                executor.submit(verify_batch, worker_id, batch, g)
-                executor.shutdown(wait=False)
-                return True
-    return False
-
-def add_key_to_pending(worker_id, key, service, source_url, source_type, author, g):
-    if worker_id not in batch_locks:
-        batch_locks[worker_id] = Lock()
-    with batch_locks[worker_id]:
-        if pending_count[worker_id] == 0:
-            pending_batch_times[worker_id] = time.time()
-        
-        pending_batches[worker_id].append((key, service, source_url, source_type, author))
-        pending_count[worker_id] += 1
-        
-        if pending_count[worker_id] >= BATCH_SIZE:
-            batch = pending_batches[worker_id].copy()
-            pending_batches[worker_id].clear()
-            count = pending_count[worker_id]
-            pending_count[worker_id] = 0
-            if worker_id in pending_batch_times:
-                del pending_batch_times[worker_id]
-            
-            safe_print(f"[Worker-{worker_id}] 📦 Triggering verification by batch size ({count} keys)")
-            executor = ThreadPoolExecutor(max_workers=1)
-            executor.submit(verify_batch, worker_id, batch, g)
-            executor.shutdown(wait=False)
-
-def extract_and_queue(text, source_url, source_type, worker_id, author, g):
-    full_text = text
-    
-    if source_type == "code" and "/blob/" in source_url:
-        file_content = get_full_file_content(source_url)
-        if file_content:
-            full_text = file_content
-            print(f"    📄 Using full file content for code")
-    
-    elif source_type == "env" and "/blob/" in source_url:
-        env_content = get_full_env_content(source_url)
-        if env_content:
-            full_text = env_content
-            print(f"    📄 Using full .env file content")
-    
-    elif source_type == "issue" and "/issues/" in source_url:
-        issue_content = get_full_issue_content(g, source_url)
-        if issue_content:
-            full_text = issue_content
-            print(f"    📄 Using full issue content")
-    
-    elif "/pull/" in source_url:
-        pr_content = get_full_pr_content(g, source_url)
-        if pr_content:
-            full_text = pr_content
-            print(f"    📄 Using full PR content")
-    
-    elif source_type == "commit" and "/commit/" in source_url:
-        commit_content = get_full_commit_content(g, source_url)
-        if commit_content:
-            full_text = commit_content
-            print(f"    📄 Using full commit diff")
-    
-    for service, pattern in KEY_PATTERNS.items():
-        for match in pattern.finditer(full_text):
-            key = match.group(0)
-            print(f"  🔑 Found {service} key in {source_type}: {source_url[:80]}...")
-            add_key_to_pending(worker_id, key, service, source_url, source_type, author, g)
-    
-    check_pending_timeout(worker_id, g)
-
-# 搜索 Workers
+# ========== Search Workers ==========
 def search_code_worker(worker_id, start_page, g):
-    safe_print(f"\n[Worker-{worker_id}] 🚀 Starting CODE scan from page {start_page} (infinite)")
+    print(f"\n[Worker-{worker_id}] Starting CODE scan")
     page = start_page
-    items_processed = 0
     consecutive_empty = 0
-
     while not stop_event.is_set():
-        check_timeout()
-        heartbeat()
-
+        check_timeout_and_exit()
         url = f"{GITHUB_API}/search/code?q={urllib.parse.quote(CODE_QUERY)}&sort=indexed&order=desc&per_page={PER_PAGE}&page={page}"
         try:
-            code, data = _http_request(url, headers=_gh_headers(), timeout=REQUEST_TIMEOUT)
-
-            if code == 403:
-                safe_print(f"[Worker-{worker_id}] CODE page {page}: HTTP 403, waiting 60s...")
-                safe_sleep(60)
-                continue
-
+            code, data = _http_request(url, _gh_headers())
             if code != 200:
-                safe_print(f"[Worker-{worker_id}] CODE page {page}: HTTP {code}, continuing")
                 page += 1
                 safe_sleep(2)
                 continue
-
             items = data.get("items", []) if isinstance(data, dict) else []
-
             if not items:
                 consecutive_empty += 1
                 if consecutive_empty >= 3:
-                    safe_print(f"[Worker-{worker_id}] CODE: No more results after {page} pages, stopping")
                     break
                 page += 1
                 safe_sleep(1)
                 continue
-
             consecutive_empty = 0
-
-            safe_print(f"[Worker-{worker_id}] 📄 CODE page {page}: {len(items)} items (total: {items_processed + len(items)})")
-
+            print(f"[Worker-{worker_id}] CODE page {page}: {len(items)} items")
             for item in items:
                 if stop_event.is_set():
                     break
                 html_url = item.get("html_url", "")
                 author = item.get("repository", {}).get("owner", {}).get("login", "unknown")
-                
                 extract_and_queue("", html_url, "code", worker_id, author, g)
-                items_processed += 1
-
             page += 1
             safe_sleep(0.5)
         except Exception as e:
-            safe_print(f"[Worker-{worker_id}] CODE error: {e}")
+            print(f"[Worker-{worker_id}] CODE error: {e}")
             page += 1
             safe_sleep(5)
-            continue
-
-    safe_print(f"[Worker-{worker_id}] CODE scan finished, processed {items_processed} items")
+    print(f"[Worker-{worker_id}] CODE scan finished")
 
 def search_issues_worker(worker_id, start_page, g):
-    safe_print(f"\n[Worker-{worker_id}] 🚀 Starting ISSUE scan from page {start_page} (infinite)")
-    query = ISSUE_QUERY
+    print(f"\n[Worker-{worker_id}] Starting ISSUE scan")
     page = start_page
-    items_processed = 0
     consecutive_empty = 0
-
     while not stop_event.is_set():
-        check_timeout()
-        heartbeat()
-
-        url = f"{GITHUB_API}/search/issues?q={urllib.parse.quote(query)}&sort=created&order=desc&per_page={PER_PAGE}&page={page}"
+        check_timeout_and_exit()
+        url = f"{GITHUB_API}/search/issues?q={urllib.parse.quote(ISSUE_QUERY)}&sort=created&order=desc&per_page={PER_PAGE}&page={page}"
         try:
-            code, data = _http_request(url, headers=_gh_headers(), timeout=REQUEST_TIMEOUT)
-
-            if code == 403:
-                safe_print(f"[Worker-{worker_id}] ISSUE page {page}: HTTP 403, waiting 60s...")
-                safe_sleep(60)
-                continue
-
+            code, data = _http_request(url, _gh_headers())
             if code != 200:
-                safe_print(f"[Worker-{worker_id}] ISSUE page {page}: HTTP {code}, continuing")
                 page += 1
                 safe_sleep(2)
                 continue
-
             items = data.get("items", []) if isinstance(data, dict) else []
-
             if not items:
                 consecutive_empty += 1
                 if consecutive_empty >= 3:
-                    safe_print(f"[Worker-{worker_id}] ISSUE: No more results after {page} pages, stopping")
                     break
                 page += 1
                 safe_sleep(1)
                 continue
-
             consecutive_empty = 0
-
-            safe_print(f"[Worker-{worker_id}] 📄 ISSUE page {page}: {len(items)} items (total: {items_processed + len(items)})")
-
+            print(f"[Worker-{worker_id}] ISSUE page {page}: {len(items)} items")
             for item in items:
                 if stop_event.is_set():
                     break
                 html_url = item.get("html_url", "")
                 author = item.get("user", {}).get("login", "unknown")
-                
-                extract_and_queue("", html_url, "issue", worker_id, author, g)
-                items_processed += 1
-
+                source_type = "pr" if "/pull/" in html_url else "issue"
+                extract_and_queue("", html_url, source_type, worker_id, author, g)
             page += 1
             safe_sleep(0.5)
         except Exception as e:
-            safe_print(f"[Worker-{worker_id}] ISSUE error: {e}")
+            print(f"[Worker-{worker_id}] ISSUE error: {e}")
             page += 1
             safe_sleep(5)
-            continue
-
-    safe_print(f"[Worker-{worker_id}] ISSUE scan finished, processed {items_processed} items")
+    print(f"[Worker-{worker_id}] ISSUE scan finished")
 
 def search_commits_worker(worker_id, start_page, g):
-    safe_print(f"\n[Worker-{worker_id}] 🚀 Starting COMMIT scan from page {start_page} (infinite)")
+    print(f"\n[Worker-{worker_id}] Starting COMMIT scan")
     page = start_page
-    items_processed = 0
     consecutive_empty = 0
-
     while not stop_event.is_set():
-        check_timeout()
-        heartbeat()
-
+        check_timeout_and_exit()
         url = f"{GITHUB_API}/search/commits?q={urllib.parse.quote(COMMIT_QUERY)}&sort=committer-date&order=desc&per_page={PER_PAGE}&page={page}"
         try:
-            code, data = _http_request(url, headers=_gh_headers(), timeout=REQUEST_TIMEOUT)
-
-            if code == 403:
-                safe_print(f"[Worker-{worker_id}] COMMIT page {page}: HTTP 403, waiting 60s...")
-                safe_sleep(60)
-                continue
-
+            code, data = _http_request(url, _gh_headers())
             if code != 200:
-                safe_print(f"[Worker-{worker_id}] COMMIT page {page}: HTTP {code}, continuing")
                 page += 1
                 safe_sleep(2)
                 continue
-
             items = data.get("items", []) if isinstance(data, dict) else []
-
             if not items:
                 consecutive_empty += 1
                 if consecutive_empty >= 3:
-                    safe_print(f"[Worker-{worker_id}] COMMIT: No more results after {page} pages, stopping")
                     break
                 page += 1
                 safe_sleep(1)
                 continue
-
             consecutive_empty = 0
-
-            safe_print(f"[Worker-{worker_id}] 📄 COMMIT page {page}: {len(items)} items (total: {items_processed + len(items)})")
-
+            print(f"[Worker-{worker_id}] COMMIT page {page}: {len(items)} items")
             for item in items:
                 if stop_event.is_set():
                     break
                 html_url = item.get("html_url", "")
                 author = item.get("author", {}).get("login", "unknown") if item.get("author") else "unknown"
-                
                 extract_and_queue("", html_url, "commit", worker_id, author, g)
-                items_processed += 1
-
             page += 1
             safe_sleep(0.5)
         except Exception as e:
-            safe_print(f"[Worker-{worker_id}] COMMIT error: {e}")
+            print(f"[Worker-{worker_id}] COMMIT error: {e}")
             page += 1
             safe_sleep(5)
-            continue
-
-    safe_print(f"[Worker-{worker_id}] COMMIT scan finished, processed {items_processed} items")
+    print(f"[Worker-{worker_id}] COMMIT scan finished")
 
 def search_env_worker(worker_id, start_page, g):
-    safe_print(f"\n[Worker-{worker_id}] 🚀 Starting ENV file scan (page {start_page})")
+    print(f"\n[Worker-{worker_id}] Starting ENV scan")
     page = start_page
-    items_processed = 0
     consecutive_empty = 0
-
     while not stop_event.is_set():
-        check_timeout()
-        heartbeat()
-
+        check_timeout_and_exit()
         url = f"{GITHUB_API}/search/code?q={urllib.parse.quote(ENV_QUERY)}&sort=indexed&order=desc&per_page={PER_PAGE}&page={page}"
         try:
-            code, data = _http_request(url, headers=_gh_headers(), timeout=REQUEST_TIMEOUT)
-
-            if code == 403:
-                safe_print(f"[Worker-{worker_id}] ENV page {page}: HTTP 403, waiting 60s...")
-                safe_sleep(60)
-                continue
-
+            code, data = _http_request(url, _gh_headers())
             if code != 200:
-                safe_print(f"[Worker-{worker_id}] ENV page {page}: HTTP {code}, continuing")
                 page += 1
                 safe_sleep(2)
                 continue
-
             items = data.get("items", []) if isinstance(data, dict) else []
-
             if not items:
                 consecutive_empty += 1
                 if consecutive_empty >= 3:
-                    safe_print(f"[Worker-{worker_id}] ENV: No more results after {page} pages, stopping")
                     break
                 page += 1
                 safe_sleep(1)
                 continue
-
             consecutive_empty = 0
-
-            safe_print(f"[Worker-{worker_id}] ENV page {page}: {len(items)} items (total: {items_processed + len(items)})")
-
+            print(f"[Worker-{worker_id}] ENV page {page}: {len(items)} items")
             for item in items:
                 if stop_event.is_set():
                     break
                 html_url = item.get("html_url", "")
                 author = item.get("repository", {}).get("owner", {}).get("login", "unknown")
-                
                 extract_and_queue("", html_url, "env", worker_id, author, g)
-                items_processed += 1
-
             page += 1
             safe_sleep(0.5)
         except Exception as e:
-            safe_print(f"[Worker-{worker_id}] ENV error: {e}")
+            print(f"[Worker-{worker_id}] ENV error: {e}")
             page += 1
             safe_sleep(5)
-            continue
+    print(f"[Worker-{worker_id}] ENV scan finished")
 
-    safe_print(f"[Worker-{worker_id}] ENV scan finished, processed {items_processed} files")
+def _gh_headers():
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": random_ua()}
+    if PAT_TOKEN:
+        headers["Authorization"] = f"Bearer {PAT_TOKEN}"
+    return headers
+
+def _http_request(url, headers):
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT, context=ctx) as resp:
+            raw = resp.read().decode("utf-8")
+            try:
+                return resp.status, json.loads(raw)
+            except:
+                return resp.status, raw
+    except urllib.error.HTTPError as e:
+        return e.code, str(e)
+    except Exception as e:
+        return 0, str(e)
+
+def safe_sleep(seconds):
+    elapsed = 0
+    while elapsed < seconds and not stop_event.is_set():
+        check_timeout_and_exit()
+        time.sleep(min(0.5, seconds - elapsed))
+        elapsed += 0.5
+
+def heartbeat():
+    global last_heartbeat
+    now = time.time()
+    if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+        elapsed = now - start_time
+        remaining = MAX_RUNTIME_SECONDS - elapsed
+        print(f"❤️ Alive: {elapsed:.0f}s / {MAX_RUNTIME_SECONDS}s (remaining: {remaining:.0f}s)")
+        print(f"📊 Cache: files={len(file_cache.cache)}, issues={len(issue_cache.cache)}, "
+              f"prs={len(pr_cache.cache)}, commits={len(commit_cache.cache)}, env={len(env_cache.cache)}")
+        last_heartbeat = now
 
 def main():
+    global batch_manager
     print("=" * 70)
-    print("🤖 API Key Leak Scanner - Verifiable Keys Only")
+    print("🤖 API Key Leak Scanner - Production Ready v2.9")
     print(f"📁 Fallback repo: {REPO_NAME}")
     print(f"⏱️  Max runtime: {MAX_RUNTIME_SECONDS}s (50 minutes)")
     print(f"📦 Batch size: {BATCH_SIZE} keys OR {BATCH_TIMEOUT}s timeout")
-    print(f"💾 Cache: max {MAX_CACHE_SIZE} items, TTL {MAX_CACHE_AGE}s")
-    print(f"⏲️  Max backoff: {MAX_BACKOFF}s")
-    print(f"🔍 Deep scan max files: {DEEP_SCAN_MAX_FILES}")
-    print("📊 Scanning: CODE + ISSUES + COMMITS + ENV (infinite pages)")
-    print("✨ Feature: Deep repository scan when ANY key is found")
-    print(f"🔑 Key patterns loaded: {len(KEY_PATTERNS)} types (verifiable only)")
-    print(f"✅ Verifiers loaded: {len(VERIFIERS)} types")
+    print(f"🔍 Scanning: CODE + ISSUES/PRs + COMMITS + ENV")
+    print(f"🧠 Fake key filter: entropy < {FAKE_KEY_ENTROPY_THRESHOLD} (body only)")
     print("=" * 70)
 
     g = get_github_client()
     if not g:
         print("❌ Failed to initialize GitHub client")
         return
+    print("✅ GitHub client initialized")
 
-    print("✅ GitHub client initialized\n")
+    batch_manager = BatchManager(verify_batch, BATCH_SIZE, BATCH_TIMEOUT)
 
     with ThreadPoolExecutor(max_workers=SEARCH_WORKERS) as executor:
         futures = [
@@ -1328,19 +959,26 @@ def main():
             executor.submit(search_issues_worker, 4, 6, g),
             executor.submit(search_env_worker, 5, 1, g),
         ]
-        for future in as_completed(futures):
+        while not stop_event.is_set():
+            time.sleep(1)
+            check_timeout_and_exit()
+            heartbeat()
+            if all(f.done() for f in futures):
+                break
+        stop_event.set()
+        for future in futures:
             try:
-                future.result()
+                future.result(timeout=5)
             except:
                 pass
 
+    graceful_shutdown()
     print(f"\n✅ Scan completed. Found {len(found_valid_keys)} valid keys.")
-    print(f"📝 Results saved to valid_keys_final_*.txt")
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
         print(f"❌ Fatal error: {e}")
-        save_final_results()
+        graceful_shutdown()
         sys.exit(1)
