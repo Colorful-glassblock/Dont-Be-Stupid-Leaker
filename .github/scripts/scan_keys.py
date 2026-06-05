@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-API Key Leak Scanner - Production Ready v3.1.7
-- Gemini 403 now treated as invalid (was "Valid but restricted")
-- Added duplicate issue check before creating issue in own repo
-- All previous fixes retained
+API Key Leak Scanner - Production Ready v3.1.8
+- Fixed NameError: github_session now initialized at module level
+- Graceful shutdown guards against uninitialized github_session
+- Retained all v3.1.7 features (Gemini 403 invalid, issue dedup, etc.)
 """
 
 import os
@@ -77,6 +77,7 @@ stop_event = Event()
 shutdown_requested = False
 
 auth_token: Optional[str] = None
+github_session = None  # Fix NameError: initialize global variable
 
 deep_scan_threads: List[threading.Thread] = []
 deep_scan_threads_lock = Lock()
@@ -301,7 +302,7 @@ def _parse_xai(code, data):
     return (True, 0, "Valid") if code == 200 else (False, 0, f"HTTP {code}")
 
 def _parse_gemini(code, data):
-    # 403 means key is disabled/revoked, not "restricted" — treat as invalid
+    # 403 means key is disabled/revoked, treat as invalid
     if code == 200:
         return True, 0, "Valid"
     if code == 403:
@@ -376,7 +377,8 @@ def graceful_shutdown():
                 t.join(timeout=30)
     if batch_manager:
         print("[!] Flushing pending batches...")
-        if github_session:
+        # Safely check if github_session exists
+        if 'github_session' in globals() and github_session:
             batch_manager.flush_all(github_session)
         else:
             print("[!] No GitHub session, skipping flush")
@@ -659,10 +661,8 @@ def create_issue_in_original_repo(g, source_url, author, service, key, info, bal
         return False
 
 def _issue_already_exists_in_my_repo(g, issue_title, key_preview):
-    """Check if a similar issue already exists in the bot's own repo."""
     try:
         my_repo = g.get_repo(REPO_NAME)
-        # Check recent issues (open + closed)
         for issue in my_repo.get_issues(state="all", sort="created", direction="desc")[:50]:
             if issue.title == issue_title:
                 return True
@@ -681,7 +681,6 @@ def create_issue_in_my_repo(g, key, service, info, source_url, source_type, auth
         display_type = "Pull Request" if "/pull/" in source_url else "Issue" if "/issues/" in source_url else "Commit" if "/commit/" in source_url else source_type
         issue_title = f"{service} Key Leak in {display_type}: {short_url}"
         key_preview = key[:20] + "..." if len(key) > 20 else key
-        # Check for duplicate issue before creating
         if _issue_already_exists_in_my_repo(g, issue_title, key_preview):
             print(f"    📝 Issue already exists for this key, skipping")
             return
@@ -1172,7 +1171,7 @@ def search_env_worker(worker_id, start_page, g):
 def main():
     global batch_manager, github_session
     print("=" * 70)
-    print("🤖 API Key Leak Scanner - Production Ready v3.1.7")
+    print("🤖 API Key Leak Scanner - Production Ready v3.1.8")
     print(f"📁 Fallback repo: {REPO_NAME}")
     print(f"⏱️  Max runtime: {MAX_RUNTIME_SECONDS}s (50 minutes)")
     print(f"📦 Batch size: {BATCH_SIZE} keys OR {BATCH_TIMEOUT}s timeout")
