@@ -1,14 +1,41 @@
-close-gemini:
-  runs-on: ubuntu-latest
-  if: github.event_name == 'workflow_dispatch'
-  steps:
-    - uses: actions/checkout@v4
-    - uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-    - name: Install dependencies
-      run: pip install PyGithub
-    - name: Close restricted Gemini issues
-      env:
-        PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
-      run: python .github/scripts/close_restricted_gemini_issues.py
+name: Close Restricted Gemini Issues
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (no issues will be closed)'
+        type: boolean
+        default: true
+        required: false
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  close-gemini:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PyGithub requests PyJWT
+      
+      - name: Close restricted Gemini issues
+        env:
+          APP_ID: ${{ secrets.APP_ID }}
+          PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+          INSTALLATION_ID: ${{ secrets.INSTALLATION_ID }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: python .github/scripts/close_restricted_gemini_issues.py
