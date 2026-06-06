@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-API Key Leak Scanner - v3.3.6 (rate limit avoidance)
-- Reduced SEARCH_WORKERS to 3
-- Increased inter-request delays
-- Extended backoff with jitter on 429/403
-- Added delay between deep scan file downloads
-- Increased general error tolerance
+API Key Leak Scanner - v3.3.7 (infinite scroll + rate limit tuned)
+- Removed early exit on consecutive empty search pages (infinite scroll until API exhausted)
+- Rate limit avoidance: reduced workers, increased delays, jittered backoff
+- Deep scan and notification fixes retained
+- Other minor stability improvements
 """
 
 import os
@@ -38,7 +37,7 @@ MAX_RUNTIME_SECONDS = 50 * 60
 HEARTBEAT_INTERVAL = 60
 REQUEST_TIMEOUT = 15
 PER_PAGE = 30
-SEARCH_WORKERS = 3                      # reduced from 4 to ease rate limits
+SEARCH_WORKERS = 3                      # reduced to ease rate limits
 VERIFY_WORKERS = 20
 BATCH_SIZE = 30
 BATCH_TIMEOUT = 60
@@ -61,9 +60,9 @@ MAX_SCANNED_REPOS = 10000
 MAX_GENERAL_ERRORS = 15                # increased so workers survive occasional 403s
 MAX_401_ERRORS = 3
 MAX_PENDING_DEEP_SCANS = 10
-TOKEN_REFRESH_COOLDOWN = 120           # increased to reduce token refresh frequency
-SEARCH_DELAY = 1.2                     # base delay between successful page requests (was 0.5)
-MAX_BACKOFF = 120                      # max wait on rate limit (was 60)
+TOKEN_REFRESH_COOLDOWN = 120           # reduced frequency of token refreshes
+SEARCH_DELAY = 1.2                     # base delay between successful page requests
+MAX_BACKOFF = 120                      # max wait on rate limit
 
 APP_ID = os.environ.get("APP_ID")
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY")
@@ -1051,7 +1050,7 @@ def deep_scan_repository(repo_full_name):
                             found_count += 1
                 else:
                     resp.close()
-                # Small delay between file downloads in deep scan
+                # Small delay between deep scan file downloads
                 time.sleep(0.3)
             except Exception as e:
                 print(f"      ⚠️ Error: {e}")
@@ -1121,7 +1120,6 @@ def heartbeat():
 def _search_worker(worker_id, start_page, query, search_type):
     print(f"\n[Worker-{worker_id}] Starting {search_type.upper()} scan")
     page = start_page
-    consecutive_empty = 0
     rate_limit_errors = 0
     general_errors = 0
     page_retries = 0
@@ -1162,12 +1160,7 @@ def _search_worker(worker_id, start_page, query, search_type):
             general_errors = 0
             page_retries = 0
             items = data.get("items", []) if isinstance(data, dict) else []
-            if not items:
-                consecutive_empty += 1
-                if consecutive_empty >= 3:
-                    break
-            else:
-                consecutive_empty = 0
+            if items:
                 print(f"[Worker-{worker_id}] {search_type.upper()} page {page}: {len(items)} items")
                 for item in items:
                     if stop_event.is_set():
@@ -1186,8 +1179,9 @@ def _search_worker(worker_id, start_page, query, search_type):
                             extract_and_queue("", html_url, "commit", worker_id, author)
                     except Exception as e:
                         print(f"  ⚠️ Error processing search item: {e}")
+            # Always go to next page, no early exit for empty pages
             page += 1
-            safe_sleep(SEARCH_DELAY)   # increased base delay
+            safe_sleep(SEARCH_DELAY)
         else:
             general_errors += 1
             if general_errors >= MAX_GENERAL_ERRORS:
@@ -1212,7 +1206,7 @@ def search_env_worker(worker_id, start_page):
 def main():
     global batch_manager
     print("=" * 70)
-    print("🤖 API Key Leak Scanner - v3.3.6 (rate limit tuned)")
+    print("🤖 API Key Leak Scanner - v3.3.7 (infinite scroll)")
     print(f"📁 Fallback repo: {REPO_NAME}")
     print(f"⏱️  Max runtime: {MAX_RUNTIME_SECONDS}s (50 minutes)")
     print(f"📦 Batch size: {BATCH_SIZE} keys OR {BATCH_TIMEOUT}s timeout")
@@ -1232,7 +1226,6 @@ def main():
             executor.submit(search_code_worker, 1, 1),
             executor.submit(search_issues_worker, 2, 1),
             executor.submit(search_commits_worker, 3, 1),
-            # Removed the 4th worker (issue worker starting at page 6) to reduce load
             executor.submit(search_env_worker, 5, 1),
         ]
         while not stop_event.is_set():
