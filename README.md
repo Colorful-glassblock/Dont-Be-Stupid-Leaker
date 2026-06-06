@@ -23,6 +23,22 @@
 > ⚡ **Proud supporter of Ban Comic Sans** ⚡  
 > This README uses JetBrains Mono exclusively. Comic Sans is forbidden.
 
+> [!IMPORTANT]
+> 🚨 **To Certain "Genius" Fork Users**
+> 
+> Two types of galaxy-brain behavior have been observed:
+> 
+> **Type A**: Detached fork + never sync upstream  
+> Running ancient code, generating false positives everywhere, and somehow feeling proud of it. Don't come crying when your issues explode.
+> 
+> **Type B**: Private repo + unchanged `REPO_NAME`  
+> All your scan results get dumped into *my* repo, flooding me with garbage notifications. If you're so smart, why not point the webhook at your own repo while you're at it?
+> 
+> **To both types: your actions are disrupting upstream. Fix your shit or delete your repo.**
+> 
+> I will not provide any technical support for your stupidity.  
+> — The original author, not your babysitter QwQ
+
 ## 🤔 What is This
 
 A GitHub Actions bot that roasts you when you accidentally leak API keys.  
