@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """
-API Key Leak Scanner - v3.3.5 (Deep scan fix & better failure logging)
-- Fixed deep scan get_git_tree call (repo.get_git_tree)
-- Improved logging for original repo notification failures
-- Shutdown logic uses stop_event only (thread-safe)
-- Bloom filter rotation order fixed (pop oldest before inserting new)
-- Token refresh cooldown and private key handling retained
-- Unified HTTP via requests library
-- All previous fixes and improvements retained
+API Key Leak Scanner - v3.3.7 (infinite scroll + rate limit tuned)
+- Removed early exit on consecutive empty search pages (infinite scroll until API exhausted)
+- Rate limit avoidance: reduced workers, increased delays, jittered backoff
+- Deep scan and notification fixes retained
+- Other minor stability improvements
 """
 
 import os
@@ -40,7 +37,7 @@ MAX_RUNTIME_SECONDS = 50 * 60
 HEARTBEAT_INTERVAL = 60
 REQUEST_TIMEOUT = 15
 PER_PAGE = 30
-SEARCH_WORKERS = 4
+SEARCH_WORKERS = 3                      # reduced to ease rate limits
 VERIFY_WORKERS = 20
 BATCH_SIZE = 30
 BATCH_TIMEOUT = 60
@@ -60,10 +57,12 @@ BLOOM_FILTER_HASHES = 7
 DEEP_SCAN_THREADS = 3
 MAX_WARNED_URLS = 5000
 MAX_SCANNED_REPOS = 10000
-MAX_GENERAL_ERRORS = 10
+MAX_GENERAL_ERRORS = 15                # increased so workers survive occasional 403s
 MAX_401_ERRORS = 3
 MAX_PENDING_DEEP_SCANS = 10
-TOKEN_REFRESH_COOLDOWN = 60
+TOKEN_REFRESH_COOLDOWN = 120           # reduced frequency of token refreshes
+SEARCH_DELAY = 1.2                     # base delay between successful page requests
+MAX_BACKOFF = 120                      # max wait on rate limit
 
 APP_ID = os.environ.get("APP_ID")
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY")
@@ -107,7 +106,6 @@ def strip_fragment(url: str) -> str:
     return url
 
 def strip_query_params(url: str) -> str:
-    """Remove both fragment and query parameters from a URL."""
     url = strip_fragment(url)
     parsed = urlparse(url)
     return urlunparse(parsed._replace(query=''))
@@ -254,15 +252,11 @@ scanned_repos: Set[str] = set()
 scanned_repos_lock = Lock()
 
 def _prune_exact_set():
-    """Remove oldest entries and add them to the current Bloom filter.
-    Then rotate filters: pop the oldest (if > 2 layers) and insert a new empty filter.
-    """
     while len(processed_exact) >= MAX_PROCESSED_EXACT:
         oldest_key, _ = processed_exact.popitem(last=False)
         bloom_filters[0].add(oldest_key)
-    # Rotation: keep at most 3 layers. Pop oldest first, then add new.
     if len(bloom_filters) >= 3:
-        bloom_filters.pop()          # discard the oldest filter
+        bloom_filters.pop()
     bloom_filters.insert(0, BloomFilter())
 
 def is_duplicate(key: str, source_url: str) -> bool:
@@ -475,16 +469,14 @@ def random_ua():
     return random.choice(USER_AGENTS)
 
 def check_timeout_and_exit():
-    # Unified shutdown trigger using stop_event
     if time.time() - start_time >= MAX_RUNTIME_SECONDS and not stop_event.is_set():
         print(f"\nMax runtime reached ({MAX_RUNTIME_SECONDS}s). Shutting down...")
         stop_event.set()
 
 def graceful_shutdown():
-    # Ensure only one thread performs shutdown
     with shutdown_lock:
         if stop_event.is_set():
-            return  # already shutting down
+            return
         stop_event.set()
     print("\n[!] Graceful shutdown initiated...")
     print("[!] Waiting for deep scans to finish...")
@@ -894,7 +886,6 @@ def handle_leak(key, service, info, source_url, source_type, author, balance):
     elif "/blob/" in source_url:
         success = create_issue_in_original_repo(gh, source_url, author, service, key, info, balance)
         create_issue_in_my_repo(gh, key, service, info, source_url, source_type, author, balance, is_fallback=not success)
-        # Deep scan with semaphore, non-blocking
         try:
             repo_full_name = source_url.replace("https://github.com/", "").split("/blob/")[0]
             with scanned_repos_lock:
@@ -1012,7 +1003,6 @@ def deep_scan_repository(repo_full_name):
     try:
         commit = repo.get_commit(sha=branch)
         tree = commit.commit.tree
-        # Fixed: use repo.get_git_tree, not gh.get_git_tree
         git_tree = repo.get_git_tree(tree.sha, recursive=True)
         if git_tree.truncated:
             print(f"  ⚠️ Tree truncated (repo too large), results may be incomplete")
@@ -1060,6 +1050,8 @@ def deep_scan_repository(repo_full_name):
                             found_count += 1
                 else:
                     resp.close()
+                # Small delay between deep scan file downloads
+                time.sleep(0.3)
             except Exception as e:
                 print(f"      ⚠️ Error: {e}")
     except Exception as e:
@@ -1088,8 +1080,10 @@ def _http_request(url, retries=2):
             if resp.status_code == 200:
                 return resp.status_code, data
             if resp.status_code in (429, 403):
-                wait = min(60, (2 ** attempt) * 5)
-                print(f"  ⚠️ HTTP {resp.status_code} - backing off {wait}s")
+                # backoff with jitter
+                base_wait = min(MAX_BACKOFF, (2 ** attempt) * 5)
+                wait = base_wait + random.uniform(0, 5)
+                print(f"  ⚠️ HTTP {resp.status_code} - backing off {wait:.1f}s")
                 time.sleep(wait)
                 if attempt == retries:
                     return resp.status_code, str(data)
@@ -1126,7 +1120,6 @@ def heartbeat():
 def _search_worker(worker_id, start_page, query, search_type):
     print(f"\n[Worker-{worker_id}] Starting {search_type.upper()} scan")
     page = start_page
-    consecutive_empty = 0
     rate_limit_errors = 0
     general_errors = 0
     page_retries = 0
@@ -1167,12 +1160,7 @@ def _search_worker(worker_id, start_page, query, search_type):
             general_errors = 0
             page_retries = 0
             items = data.get("items", []) if isinstance(data, dict) else []
-            if not items:
-                consecutive_empty += 1
-                if consecutive_empty >= 3:
-                    break
-            else:
-                consecutive_empty = 0
+            if items:
                 print(f"[Worker-{worker_id}] {search_type.upper()} page {page}: {len(items)} items")
                 for item in items:
                     if stop_event.is_set():
@@ -1191,8 +1179,9 @@ def _search_worker(worker_id, start_page, query, search_type):
                             extract_and_queue("", html_url, "commit", worker_id, author)
                     except Exception as e:
                         print(f"  ⚠️ Error processing search item: {e}")
+            # Always go to next page, no early exit for empty pages
             page += 1
-            safe_sleep(0.5)
+            safe_sleep(SEARCH_DELAY)
         else:
             general_errors += 1
             if general_errors >= MAX_GENERAL_ERRORS:
@@ -1217,7 +1206,7 @@ def search_env_worker(worker_id, start_page):
 def main():
     global batch_manager
     print("=" * 70)
-    print("🤖 API Key Leak Scanner - v3.3.5 (deep scan & notification fixes)")
+    print("🤖 API Key Leak Scanner - v3.3.7 (infinite scroll)")
     print(f"📁 Fallback repo: {REPO_NAME}")
     print(f"⏱️  Max runtime: {MAX_RUNTIME_SECONDS}s (50 minutes)")
     print(f"📦 Batch size: {BATCH_SIZE} keys OR {BATCH_TIMEOUT}s timeout")
@@ -1237,7 +1226,6 @@ def main():
             executor.submit(search_code_worker, 1, 1),
             executor.submit(search_issues_worker, 2, 1),
             executor.submit(search_commits_worker, 3, 1),
-            executor.submit(search_issues_worker, 4, 6),
             executor.submit(search_env_worker, 5, 1),
         ]
         while not stop_event.is_set():
