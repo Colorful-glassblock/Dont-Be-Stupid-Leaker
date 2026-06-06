@@ -1,24 +1,21 @@
 #!/usr/bin/env python3
 """
-API Key Leak Scanner - Production Ready v3.3.0
-- Fixed deadlock: processed_exact_lock changed to RLock
-- Fixed data race: bloom filter add now inside lock
-- Fixed raw URL encoding for branch names with slashes
-- Deep scan semaphore now non-blocking to avoid verify thread starvation
-- Other minor stability improvements
+API Key Leak Scanner - v3.3.4 (Shutdown & dedup refinements)
+- Removed shutdown_requested flag; unified close signalling via stop_event and shutdown_lock
+- Bloom filter rotation order adjusted: pop oldest before inserting new
+- Increased MAX_PROCESSED_EXACT to 500k to reduce rotation frequency
+- All previous v3.3.3 fixes retained
 """
 
 import os
 import re
 import sys
 import json
-import ssl
 import jwt
 import time
 import signal
 import random
 import urllib.parse
-import urllib.request
 import math
 import threading
 from datetime import datetime
@@ -54,7 +51,7 @@ MAX_CACHE_AGE = 3600
 FAKE_KEY_ENTROPY_THRESHOLD = 2.5
 MAX_RATE_LIMIT_RETRIES = 5
 MAX_PAGE_RETRIES = 5
-MAX_PROCESSED_EXACT = 200_000
+MAX_PROCESSED_EXACT = 500_000          # increased to reduce Bloom filter rotation
 BLOOM_FILTER_SIZE = 10_000_000
 BLOOM_FILTER_HASHES = 7
 DEEP_SCAN_THREADS = 3
@@ -63,6 +60,7 @@ MAX_SCANNED_REPOS = 10000
 MAX_GENERAL_ERRORS = 10
 MAX_401_ERRORS = 3
 MAX_PENDING_DEEP_SCANS = 10
+TOKEN_REFRESH_COOLDOWN = 60
 
 APP_ID = os.environ.get("APP_ID")
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY")
@@ -83,7 +81,6 @@ ENV_QUERY = 'filename:.env OR filename:.env.example OR filename:.env.local OR fi
 start_time = time.time()
 last_heartbeat = start_time
 stop_event = Event()
-shutdown_requested = False
 shutdown_lock = Lock()
 
 _thread_local = local()
@@ -91,6 +88,7 @@ _thread_local = local()
 auth_token: Optional[str] = None
 auth_token_lock = Lock()
 token_expires_at = 0.0
+last_token_refresh_time = 0.0
 
 deep_scan_pool = ThreadPoolExecutor(max_workers=DEEP_SCAN_THREADS, thread_name_prefix="deepscan")
 deep_scan_semaphore = Semaphore(MAX_PENDING_DEEP_SCANS)
@@ -104,6 +102,12 @@ def strip_fragment(url: str) -> str:
     if parsed.fragment:
         return urlunparse(parsed._replace(fragment=''))
     return url
+
+def strip_query_params(url: str) -> str:
+    """Remove both fragment and query parameters from a URL."""
+    url = strip_fragment(url)
+    parsed = urlparse(url)
+    return urlunparse(parsed._replace(query=''))
 
 # ========== Thread-local HTTP session ==========
 def get_http_session() -> requests.Session:
@@ -127,16 +131,23 @@ def get_github_client() -> Optional[Github]:
     return gh
 
 def _get_valid_token() -> Optional[str]:
-    global auth_token, token_expires_at
+    global auth_token, token_expires_at, last_token_refresh_time
     if PAT_TOKEN:
         return PAT_TOKEN
     if APP_ID and PRIVATE_KEY and INSTALLATION_ID:
         with auth_token_lock:
-            if auth_token and time.time() < token_expires_at - 60:
+            now = time.time()
+            if auth_token and now < token_expires_at - 60 and (now - last_token_refresh_time) < TOKEN_REFRESH_COOLDOWN:
+                return auth_token
+            if auth_token and now < token_expires_at - 60:
                 return auth_token
             try:
-                private_key = PRIVATE_KEY.replace('\\n', '\n')
-                payload = {"iat": int(time.time()), "exp": int(time.time()) + 600, "iss": APP_ID}
+                private_key = PRIVATE_KEY
+                if '\\n' in private_key:
+                    private_key = private_key.replace('\\n', '\n')
+                if '\n' not in private_key and '\\n' in PRIVATE_KEY:
+                    private_key = PRIVATE_KEY.replace('\\n', '\n')
+                payload = {"iat": int(now), "exp": int(now) + 600, "iss": APP_ID}
                 jwt_token = jwt.encode(payload, private_key, algorithm="RS256")
                 url = f"https://api.github.com/app/installations/{INSTALLATION_ID}/access_tokens"
                 headers = {"Authorization": f"Bearer {jwt_token}", "Accept": "application/vnd.github+json"}
@@ -145,7 +156,8 @@ def _get_valid_token() -> Optional[str]:
                     data = resp.json()
                     token = data["token"]
                     auth_token = token
-                    token_expires_at = time.time() + 600 - 60
+                    token_expires_at = now + 600 - 60
+                    last_token_refresh_time = now
                     return token
                 else:
                     print(f"❌ Failed to get installation token: HTTP {resp.status_code}")
@@ -169,6 +181,10 @@ class LRUCache:
         self.cache: OrderedDict[str, Tuple[Any, float]] = OrderedDict()
         self.lock = RLock()
     
+    def __len__(self) -> int:
+        with self.lock:
+            return len(self.cache)
+    
     def get(self, key: str) -> Optional[Any]:
         with self.lock:
             if key in self.cache:
@@ -181,10 +197,12 @@ class LRUCache:
     def put(self, key: str, value: Any) -> None:
         with self.lock:
             if key in self.cache:
-                del self.cache[key]
-            elif len(self.cache) >= self.max_size:
-                self.cache.popitem(last=False)
-            self.cache[key] = (value, time.time())
+                self.cache[key] = (value, time.time())
+                self.cache.move_to_end(key)
+            else:
+                if len(self.cache) >= self.max_size:
+                    self.cache.popitem(last=False)
+                self.cache[key] = (value, time.time())
     
     def clear(self) -> None:
         with self.lock:
@@ -226,7 +244,6 @@ class BloomFilter:
                     return False
         return True
 
-# FIX: Use RLock to allow re-entrancy from _prune_exact_set
 processed_exact: "OrderedDict[str, bool]" = OrderedDict()
 processed_exact_lock = RLock()
 bloom_filters: List[BloomFilter] = [BloomFilter()]
@@ -234,14 +251,16 @@ scanned_repos: Set[str] = set()
 scanned_repos_lock = Lock()
 
 def _prune_exact_set():
-    """Trim the exact set and create a new bloom filter layer.
-    Must be called while holding processed_exact_lock."""
+    """Remove oldest entries and add them to the current Bloom filter.
+    Then rotate filters: pop the oldest (if > 2 layers) and insert a new empty filter.
+    """
     while len(processed_exact) >= MAX_PROCESSED_EXACT:
-        oldest = next(iter(processed_exact))
-        del processed_exact[oldest]
+        oldest_key, _ = processed_exact.popitem(last=False)
+        bloom_filters[0].add(oldest_key)
+    # Rotation: keep at most 3 layers. Pop oldest first, then add new.
+    if len(bloom_filters) >= 3:
+        bloom_filters.pop()          # discard the oldest filter
     bloom_filters.insert(0, BloomFilter())
-    if len(bloom_filters) > 3:
-        bloom_filters.pop()
 
 def is_duplicate(key: str, source_url: str) -> bool:
     combo = f"{key}|{source_url}"
@@ -250,12 +269,10 @@ def is_duplicate(key: str, source_url: str) -> bool:
             return True
         if len(processed_exact) >= MAX_PROCESSED_EXACT:
             _prune_exact_set()
-        # Check all bloom filters (most recent first)
         for bf in bloom_filters:
             if bf.contains(combo):
                 return True
         processed_exact[combo] = True
-        # FIX: add to bloom filter inside the lock to prevent data race
         bloom_filters[0].add(combo)
     return False
 
@@ -316,7 +333,10 @@ class BatchManager:
                 self._submit_verify(worker_id, batch, count)
     
     def _submit_verify(self, worker_id, batch, batch_size):
-        self._executor.submit(self.verify_func, worker_id, batch, batch_size)
+        try:
+            self._executor.submit(self.verify_func, worker_id, batch, batch_size)
+        except RuntimeError:
+            pass
     
     def flush_all(self):
         with self.global_lock:
@@ -356,8 +376,22 @@ def _parse_stripe(code, data):
 def _parse_deepseek(code, data):
     if code != 200 or not isinstance(data, dict) or not data.get("is_available"):
         return False, 0, f"HTTP {code}" if code != 200 else "Invalid"
-    cny = sum(float(i.get("total_balance", 0)) for i in data.get("balance_infos", []) if i.get("currency") == "CNY")
-    usd = sum(float(i.get("total_balance", 0)) for i in data.get("balance_infos", []) if i.get("currency") == "USD")
+    cny = 0.0
+    usd = 0.0
+    try:
+        for item in data.get("balance_infos", []):
+            currency = item.get("currency", "")
+            balance_str = item.get("total_balance", "0")
+            try:
+                balance = float(balance_str)
+            except (ValueError, TypeError):
+                balance = 0.0
+            if currency == "CNY":
+                cny += balance
+            elif currency == "USD":
+                usd += balance
+    except Exception:
+        pass
     info = f"CNY: {cny:.2f}, USD: {usd:.2f}" if cny or usd else "Valid (no balance)"
     return True, cny + usd * 7.2, info
 
@@ -381,7 +415,16 @@ def _parse_github_token(code, data):
     return (True, 0, "Valid") if code == 200 else (False, 0, "Invalid")
 
 def _parse_generic_token(code, data):
-    return (True, 0, "Valid") if code == 200 else (False, 0, f"HTTP {code}")
+    if code == 200:
+        if isinstance(data, dict):
+            if data.get("error"):
+                return False, 0, f"Invalid: {data.get('error')}"
+            if data.get("errors"):
+                return False, 0, "Invalid (errors returned)"
+            if data.get("message") and "error" in str(data.get("message")).lower():
+                return False, 0, f"Invalid: {data.get('message')}"
+        return True, 0, "Valid"
+    return False, 0, f"HTTP {code}"
 
 VERIFIERS = {
     "OpenAI": {"url": "https://api.openai.com/v1/models", "headers": lambda k: {"Authorization": f"Bearer {k}"}, "method": "GET", "parse": _parse_openai},
@@ -429,20 +472,19 @@ def random_ua():
     return random.choice(USER_AGENTS)
 
 def check_timeout_and_exit():
-    if time.time() - start_time >= MAX_RUNTIME_SECONDS and not shutdown_requested:
+    # Unified shutdown trigger using stop_event
+    if time.time() - start_time >= MAX_RUNTIME_SECONDS and not stop_event.is_set():
         print(f"\nMax runtime reached ({MAX_RUNTIME_SECONDS}s). Shutting down...")
-        global shutdown_requested
-        shutdown_requested = True
         stop_event.set()
 
 def graceful_shutdown():
-    global shutdown_requested
+    # Ensure only one thread performs shutdown
     with shutdown_lock:
-        if shutdown_requested:
-            return
-        shutdown_requested = True
+        if stop_event.is_set():
+            return  # already shutting down
+        stop_event.set()
     print("\n[!] Graceful shutdown initiated...")
-    stop_event.set()
+    print("[!] Waiting for deep scans to finish...")
     try:
         deep_scan_pool.shutdown(wait=False, cancel_futures=True)
     except TypeError:
@@ -457,8 +499,7 @@ def graceful_shutdown():
     print("[!] Shutdown complete.")
 
 def signal_handler(sig, frame):
-    global shutdown_requested
-    shutdown_requested = True
+    # Only set stop_event, no heavy work
     stop_event.set()
 
 signal.signal(signal.SIGINT, signal_handler)
@@ -504,27 +545,26 @@ Source: {source_url}
 ---
 {BOT_SIGNATURE}{install_note}"""
 
+def build_raw_url(source_url: str) -> Optional[str]:
+    try:
+        clean = strip_query_params(source_url)
+        parts = clean.replace("https://github.com/", "").split("/blob/")
+        if len(parts) != 2:
+            return None
+        repo_path = parts[0]
+        ref_path = parts[1]
+        encoded_ref_path = urllib.parse.quote(ref_path, safe='/')
+        return f"https://raw.githubusercontent.com/{repo_path}/{encoded_ref_path}"
+    except Exception:
+        return None
+
 def get_full_file_content(source_url):
     source_url = strip_fragment(source_url)
     cached = file_cache.get(source_url)
     if cached:
         return cached
-    try:
-        parts = source_url.replace("https://github.com/", "").split("/blob/")
-        if len(parts) != 2:
-            return None
-        repo_path = parts[0]
-        ref_path = parts[1]
-        # Split branch and file path, encode separately
-        if '/' in ref_path:
-            branch, file_path = ref_path.split('/', 1)
-        else:
-            branch = ref_path
-            file_path = ""
-        encoded_branch = urllib.parse.quote(branch, safe='')
-        encoded_file_path = urllib.parse.quote(file_path, safe='/') if file_path else ""
-        raw_url = f"https://raw.githubusercontent.com/{repo_path}/{encoded_branch}/{encoded_file_path}"
-    except Exception:
+    raw_url = build_raw_url(source_url)
+    if not raw_url:
         return None
     session = get_http_session()
     try:
@@ -558,7 +598,7 @@ def get_full_file_content(source_url):
     return None
 
 def get_issue_or_pr_content(source_url, g):
-    source_url = strip_fragment(source_url)
+    source_url = strip_query_params(source_url)
     cache = issue_cache if "/issues/" in source_url else pr_cache
     cached = cache.get(source_url)
     if cached:
@@ -587,7 +627,7 @@ def get_issue_or_pr_content(source_url, g):
         return ""
 
 def get_pr_diff_content(source_url, g):
-    source_url = strip_fragment(source_url)
+    source_url = strip_query_params(source_url)
     cached = pr_cache.get(source_url)
     if cached:
         return cached
@@ -624,7 +664,7 @@ def get_pr_diff_content(source_url, g):
         return ""
 
 def get_commit_content(source_url, g):
-    source_url = strip_fragment(source_url)
+    source_url = strip_query_params(source_url)
     cached = commit_cache.get(source_url)
     if cached:
         return cached
@@ -658,7 +698,7 @@ def get_commit_content(source_url, g):
         return ""
 
 def extract_and_queue(text, source_url, source_type, worker_id, author):
-    clean_url = strip_fragment(source_url)
+    clean_url = strip_query_params(source_url)
     full_text = text
     if source_type in ("code", "env") and "/blob/" in clean_url:
         content = get_full_file_content(clean_url)
@@ -846,32 +886,23 @@ def handle_leak(key, service, info, source_url, source_type, author, balance):
     elif "/blob/" in source_url:
         success = create_issue_in_original_repo(gh, source_url, author, service, key, info, balance)
         create_issue_in_my_repo(gh, key, service, info, source_url, source_type, author, balance, is_fallback=not success)
-        # Deep scan with non-blocking semaphore
+        # Deep scan with semaphore, non-blocking
         try:
             repo_full_name = source_url.replace("https://github.com/", "").split("/blob/")[0]
             with scanned_repos_lock:
                 if repo_full_name not in scanned_repos and len(scanned_repos) < MAX_SCANNED_REPOS:
                     scanned_repos.add(repo_full_name)
-                    # Non-blocking acquire: if pool full, submit a thread that waits
                     if deep_scan_semaphore.acquire(blocking=False):
-                        deep_scan_pool.submit(_deep_scan_wrapper, repo_full_name)
-                    else:
-                        # Pool is full; launch a temporary thread to wait and then execute
-                        threading.Thread(target=_delayed_deep_scan, args=(repo_full_name,), daemon=True).start()
+                        try:
+                            deep_scan_pool.submit(_deep_scan_wrapper, repo_full_name)
+                        except RuntimeError:
+                            deep_scan_semaphore.release()
         except Exception:
             pass
     else:
         create_issue_in_my_repo(gh, key, service, info, source_url, source_type, author, balance, is_fallback=False)
 
 def _deep_scan_wrapper(repo_full_name):
-    try:
-        deep_scan_repository(repo_full_name)
-    finally:
-        deep_scan_semaphore.release()
-
-def _delayed_deep_scan(repo_full_name):
-    """Wait for semaphore, then run deep scan."""
-    deep_scan_semaphore.acquire()
     try:
         deep_scan_repository(repo_full_name)
     finally:
@@ -932,7 +963,11 @@ def verify_batch(worker_id, batch, batch_size):
                 resp_data = resp.json() if resp.text else None
             except Exception:
                 resp_data = None
-            valid, balance, info = verifier["parse"](resp.status_code, resp_data)
+            try:
+                valid, balance, info = verifier["parse"](resp.status_code, resp_data)
+            except Exception as parse_exc:
+                print(f"  ⚠️ [{service}] Parser error for {key[:25]}... -> {parse_exc}")
+                valid, balance, info = False, 0, f"Parser error: {str(parse_exc)[:30]}"
             if valid:
                 results.append((key, service, valid, balance, info, source_url, source_type, author))
                 print(f"  ✅ [{service}] {key[:25]}... -> {info}")
@@ -988,9 +1023,9 @@ def deep_scan_repository(repo_full_name):
             files_scanned += 1
             print(f"    📄 Scanning: {file_path}")
             try:
-                encoded_branch = urllib.parse.quote(branch, safe='')
-                encoded_path = urllib.parse.quote(file_path, safe='/')
-                raw_url = f"https://raw.githubusercontent.com/{repo_full_name}/{encoded_branch}/{encoded_path}"
+                ref_path = branch + '/' + file_path
+                encoded_ref_path = urllib.parse.quote(ref_path, safe='/')
+                raw_url = f"https://raw.githubusercontent.com/{repo_full_name}/{encoded_ref_path}"
                 session = get_http_session()
                 resp = session.get(raw_url, timeout=10, stream=True)
                 if resp.status_code == 200:
@@ -1031,36 +1066,32 @@ def _gh_headers():
         headers["Authorization"] = f"Bearer {token}"
     return headers
 
-def _http_request(url, headers, retries=2):
+def _http_request(url, retries=2):
+    session = get_http_session()
     for attempt in range(retries + 1):
+        headers = _gh_headers()
         try:
-            req = urllib.request.Request(url, headers=headers)
-            ctx = ssl.create_default_context()
-            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT, context=ctx) as resp:
-                raw = resp.read().decode("utf-8")
-                try:
-                    return resp.status, json.loads(raw)
-                except:
-                    return resp.status, raw
-        except urllib.error.HTTPError as e:
+            resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
             try:
-                e.read()
-            except:
-                pass
-            if e.code in (429, 403):
+                data = resp.json()
+            except Exception:
+                data = resp.text
+            if resp.status_code == 200:
+                return resp.status_code, data
+            if resp.status_code in (429, 403):
                 wait = min(60, (2 ** attempt) * 5)
-                print(f"  ⚠️ HTTP {e.code} - backing off {wait}s")
+                print(f"  ⚠️ HTTP {resp.status_code} - backing off {wait}s")
                 time.sleep(wait)
                 if attempt == retries:
-                    return e.code, str(e)
-            elif e.code >= 500:
+                    return resp.status_code, str(data)
+            elif resp.status_code >= 500:
                 if attempt < retries:
                     time.sleep(2)
                     continue
-                return e.code, str(e)
+                return resp.status_code, str(data)
             else:
-                return e.code, str(e)
-        except Exception as e:
+                return resp.status_code, str(data)
+        except requests.RequestException as e:
             if attempt == retries:
                 return 0, str(e)
             time.sleep(2)
@@ -1079,8 +1110,8 @@ def heartbeat():
         elapsed = now - start_time
         remaining = MAX_RUNTIME_SECONDS - elapsed
         print(f"❤️ Alive: {elapsed:.0f}s / {MAX_RUNTIME_SECONDS}s (remaining: {remaining:.0f}s)")
-        print(f"📊 Cache: files={len(file_cache.cache)}, issues={len(issue_cache.cache)}, "
-              f"prs={len(pr_cache.cache)}, commits={len(commit_cache.cache)}")
+        print(f"📊 Cache: files={len(file_cache)}, issues={len(issue_cache)}, "
+              f"prs={len(pr_cache)}, commits={len(commit_cache)}")
         last_heartbeat = now
 
 def _search_worker(worker_id, start_page, query, search_type):
@@ -1091,10 +1122,12 @@ def _search_worker(worker_id, start_page, query, search_type):
     general_errors = 0
     page_retries = 0
     consecutive_401 = 0
-    while not stop_event.is_set() and not shutdown_requested:
+    while not stop_event.is_set():
         check_timeout_and_exit()
         url = f"{GITHUB_API}/search/{search_type}?q={urllib.parse.quote(query)}&sort=indexed&order=desc&per_page={PER_PAGE}&page={page}"
-        code, data = _http_request(url, _gh_headers())
+        code, data = _http_request(url)
+        if code != 401:
+            consecutive_401 = 0
         if code == 401:
             consecutive_401 += 1
             if consecutive_401 >= MAX_401_ERRORS:
@@ -1103,7 +1136,6 @@ def _search_worker(worker_id, start_page, query, search_type):
             refresh_github_client_on_error()
             safe_sleep(2)
             continue
-        consecutive_401 = 0
         if code in (429, 403):
             rate_limit_errors += 1
             if rate_limit_errors >= MAX_RATE_LIMIT_RETRIES:
@@ -1134,19 +1166,22 @@ def _search_worker(worker_id, start_page, query, search_type):
                 consecutive_empty = 0
                 print(f"[Worker-{worker_id}] {search_type.upper()} page {page}: {len(items)} items")
                 for item in items:
-                    if stop_event.is_set() or shutdown_requested:
+                    if stop_event.is_set():
                         break
-                    html_url = item.get("html_url", "")
-                    if search_type == "code":
-                        author = item.get("repository", {}).get("owner", {}).get("login", "unknown")
-                        extract_and_queue("", html_url, "code", worker_id, author)
-                    elif search_type == "issues":
-                        author = item.get("user", {}).get("login", "unknown")
-                        source_type = "pr" if "/pull/" in html_url else "issue"
-                        extract_and_queue("", html_url, source_type, worker_id, author)
-                    elif search_type == "commits":
-                        author = item.get("author", {}).get("login", "unknown") if item.get("author") else "unknown"
-                        extract_and_queue("", html_url, "commit", worker_id, author)
+                    try:
+                        html_url = item.get("html_url", "")
+                        if search_type == "code":
+                            author = item.get("repository", {}).get("owner", {}).get("login", "unknown")
+                            extract_and_queue("", html_url, "code", worker_id, author)
+                        elif search_type == "issues":
+                            author = item.get("user", {}).get("login", "unknown")
+                            source_type = "pr" if "/pull/" in html_url else "issue"
+                            extract_and_queue("", html_url, source_type, worker_id, author)
+                        elif search_type == "commits":
+                            author = (item.get("author") or {}).get("login", "unknown")
+                            extract_and_queue("", html_url, "commit", worker_id, author)
+                    except Exception as e:
+                        print(f"  ⚠️ Error processing search item: {e}")
             page += 1
             safe_sleep(0.5)
         else:
@@ -1173,7 +1208,7 @@ def search_env_worker(worker_id, start_page):
 def main():
     global batch_manager
     print("=" * 70)
-    print("🤖 API Key Leak Scanner - Production Ready v3.3.0")
+    print("🤖 API Key Leak Scanner - v3.3.4 (shutdown & dedup refinements)")
     print(f"📁 Fallback repo: {REPO_NAME}")
     print(f"⏱️  Max runtime: {MAX_RUNTIME_SECONDS}s (50 minutes)")
     print(f"📦 Batch size: {BATCH_SIZE} keys OR {BATCH_TIMEOUT}s timeout")
@@ -1196,7 +1231,7 @@ def main():
             executor.submit(search_issues_worker, 4, 6),
             executor.submit(search_env_worker, 5, 1),
         ]
-        while not stop_event.is_set() and not shutdown_requested:
+        while not stop_event.is_set():
             time.sleep(1)
             check_timeout_and_exit()
             heartbeat()
