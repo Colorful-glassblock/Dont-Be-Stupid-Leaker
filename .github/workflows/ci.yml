@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [20, 22]
+        node-version: [22, 24]  # 你用的是 24 LTS，20 太老了
 
     steps:
       - uses: actions/checkout@v4
@@ -22,17 +22,18 @@ jobs:
           node-version: ${{ matrix.node-version }}
 
       - name: Install pnpm
-        run: npm install -g pnpm
+        uses: pnpm/action-setup@v4  # 官方 action，更稳
+        with:
+          version: latest
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
       - name: Type check
-        run: |
-          echo "Node: $(node -v) | TSC: $(npx tsc --version)"
-          npx tsc --noEmit --listFiles
-          npx tsc --noEmit
-          echo "Exit code: $?"
+        run: pnpm typecheck  # 在 package.json 里定义脚本，比裸写 npx tsc 好
+
+      - name: Lint
+        run: pnpm lint  # 如果有 ESLint
 
       - name: Run tests
         run: pnpm test
