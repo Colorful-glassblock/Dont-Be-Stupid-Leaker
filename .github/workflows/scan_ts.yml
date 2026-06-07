@@ -1,6 +1,8 @@
 name: API Key Leak Scanner (TypeScript)
 
 on:
+  push:
+    branches: [experiment/ts-rewrite]
   schedule:
     - cron: '0 * * * *'
   workflow_dispatch:
@@ -31,7 +33,11 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Run type check
-        run: pnpm typecheck
+        run: |
+          echo "Node: $(node -v) | TSC: $(npx tsc --version)"
+          npx tsc --noEmit --listFiles
+          npx tsc --noEmit
+          echo "Exit code: $?"
 
       - name: Run tests
         run: pnpm test
