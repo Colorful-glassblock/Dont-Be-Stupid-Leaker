@@ -28,7 +28,24 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Type check
-        run: pnpm typecheck
+        run: |
+          echo "=== Type Check Debug Info ==="
+          echo "Node version: $(node -v)"
+          echo "TypeScript version: $(npx tsc --version)"
+          echo "Current directory: $(pwd)"
+          echo "=============================="
+          echo "Running tsc --noEmit..."
+          echo "=============================="
+          npx tsc --noEmit --pretty false 2>&1
+          EXIT_CODE=$?
+          echo "=============================="
+          echo "Exit code: $EXIT_CODE"
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "❌ Type check failed with exit code $EXIT_CODE"
+            exit $EXIT_CODE
+          else
+            echo "✅ Type check passed"
+          fi
 
       - name: Run tests
         run: pnpm test
