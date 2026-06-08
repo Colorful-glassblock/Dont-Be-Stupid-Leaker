@@ -7,11 +7,11 @@ import type { KeyPattern, ServiceName } from "../types/index.js";
  * Order matters for matching priority — more specific patterns first.
  */
 export const KEY_PATTERNS: KeyPattern[] = [
-  { service: "OpenAI",      regex: /sk-proj-[a-zA-Z0-9_\-]{50,}/ },
+  { service: "OpenAI",      regex: /sk-proj-[a-zA-Z0-9_-]{50,}/ },
   { service: "OpenRouter",  regex: /sk-or-v1-[a-zA-Z0-9]{50,}/ },
   { service: "XAI",         regex: /xai-[a-zA-Z0-9]{32,}/ },
-  { service: "Anthropic",   regex: /sk-ant-api[0-9A-Za-z\-_]{40,}/ },
-  { service: "Gemini",      regex: /AIza[0-9A-Za-z\-_]{35}/ },
+  { service: "Anthropic",   regex: /sk-ant-api[0-9A-Za-z_-]{40,}/ },
+  { service: "Gemini",      regex: /AIza[0-9A-Za-z_-]{35}/ },
   { service: "Replicate",   regex: /r8_[a-zA-Z0-9]{32,}/ },
   { service: "HuggingFace", regex: /hf_[a-zA-Z0-9]{30,}/ },
   { service: "MiMo",        regex: /tp-[a-zA-Z0-9]{10,}/ },

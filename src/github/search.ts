@@ -129,7 +129,10 @@ export async function runSearchWorker(
       // TODO: GET /search/code is deprecated by GitHub (sunset 2026-09-27).
       // Migrate to a replacement endpoint when available.
       // @see https://github.blog/changelog/2026-03-27-deprecation-of-api-search-code-fields
-      const searchFn = (octokit.search as any)[searchType === "commits" ? "commits" : searchType];
+      const searchMethod = searchType === "commits" ? "commits" : searchType;
+      const searchFn = octokit.search[searchMethod as keyof typeof octokit.search] as unknown as (
+        params: Record<string, unknown>,
+      ) => Promise<{ data: Record<string, unknown> }>;
       const { data } = await searchFn({
         q: query,
         sort: "indexed",
