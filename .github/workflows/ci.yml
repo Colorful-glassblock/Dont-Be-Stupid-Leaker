@@ -8,31 +8,30 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        node-version: [20, 22]
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node-version: [22, 24]
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
 
       - name: Setup Node.js ${{ matrix.node-version }}
         uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
-
-      - name: Install pnpm
-        run: npm install -g pnpm
+          cache: pnpm
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
       - name: Type check
-        run: |
-          echo "Node: $(node -v) | TSC: $(npx tsc --version)"
-          npx tsc --noEmit --listFiles
-          npx tsc --noEmit
-          echo "Exit code: $?"
+        run: pnpm typecheck
 
       - name: Run tests
         run: pnpm test

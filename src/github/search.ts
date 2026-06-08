@@ -129,7 +129,6 @@ export async function runSearchWorker(
       // TODO: GET /search/code is deprecated by GitHub (sunset 2026-09-27).
       // Migrate to a replacement endpoint when available.
       // @see https://github.blog/changelog/2026-03-27-deprecation-of-api-search-code-fields
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const searchFn = (octokit.search as any)[searchType === "commits" ? "commits" : searchType];
       const { data } = await searchFn({
         q: query,
