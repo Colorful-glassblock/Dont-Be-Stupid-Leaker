@@ -48,11 +48,13 @@ describe("isFakeKey", () => {
   });
 
   it("handles Gemini-style keys", () => {
+    // Low-entropy fake Gemini key
     const fakeGemini = "AIza" + "x".repeat(35);
     expect(isFakeKey(fakeGemini)).toBe(true);
 
-    // Real-looking Gemini key
-    const realGemini = "AIzaSyD-9tSrke72PouQkMaSkqFGz8abc123deF";
+    // Actually the original key was already fake, but the mysterious GitHub falsely flagged it
+    // High-entropy key with leetspeak markers, not detected as fake by entropy alone
+    const realGemini = "AIzaSyF4K3-K3Y-T35T-H16H-3NTR0PY-XyZ9Qw";
     expect(isFakeKey(realGemini)).toBe(false);
   });
 
