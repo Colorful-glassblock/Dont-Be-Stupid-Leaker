@@ -51,9 +51,9 @@ describe("isFakeKey", () => {
     const fakeGemini = "AIza" + "x".repeat(35);
     expect(isFakeKey(fakeGemini)).toBe(true);
 
-    // Real-looking Gemini key
-    const realGemini = "AIzaSyD-9tSrke72PouQkMaSkqFGz8abc123deF";
-    expect(isFakeKey(realGemini)).toBe(false);
+    // Real-looking Gemini key with leetspeak FAKE marker and high entropy
+    const realGemini = "AIzaSyF4K3-K3Y-T35T-H16H-3NTR0PY-XyZ9Qw";
+    expect(isFakeKey(realGemini)).toBe(true);
   });
 
   it("handles GitHub PAT keys", () => {
