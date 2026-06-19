@@ -1,25 +1,22 @@
 #!/usr/bin/env python3
 """
-Close old false-positive issues: Gemini 403 ("Valid but restricted") and
-any other issue whose body contains specific HTTP error keywords (e.g. HTTP 401).
+Re-verify all keys reported in open issues within our own repo.
+If a previously valid key is now invalid, comment and optionally close the issue.
 
 Usage:
-  # Preview (dry run)
-  DRY_RUN=true python close_false_positive_issues.py
-
-  # Actually close
-  python close_false_positive_issues.py
-
-  # Custom keywords (comma separated)
-  KEYWORDS="Valid but restricted,HTTP 401,Invalid (403)" python close_false_positive_issues.py
+  DRY_RUN=true python revalidate_issues.py   # preview only
+  python revalidate_issues.py                 # actually comment/close
 """
 
 import os
+import re
 import sys
 import time
+import json
+import urllib.parse
 import requests
 import jwt
-from typing import Optional, List
+from typing import Optional, Dict, Any, Tuple
 
 # ---------- Configuration ----------
 REPO_NAME = os.environ.get("GITHUB_REPOSITORY", "Colorful-glassblock/Dont-Be-Stupid-Leaker")
@@ -28,9 +25,123 @@ APP_ID = os.environ.get("APP_ID")
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY")
 INSTALLATION_ID = os.environ.get("INSTALLATION_ID")
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
-# Keywords to search for in issue body (comma separated)
-KEYWORDS_STR = os.environ.get("KEYWORDS", "Valid but restricted,HTTP 401")
-KEYWORDS: List[str] = [kw.strip() for kw in KEYWORDS_STR.split(",") if kw.strip()]
+CLOSE_INVALID = os.environ.get("CLOSE_INVALID", "false").lower() == "true"   # also close issue if invalid
+
+# ---------- Key Patterns (copied from scanner) ----------
+KEY_PATTERNS = {
+    "OpenAI": re.compile(r"sk-proj-[a-zA-Z0-9_\-]{50,}"),
+    "OpenAI_Legacy": re.compile(r"sk-[a-zA-Z0-9]{32,}"),
+    "OpenRouter": re.compile(r"sk-or-v1-[a-zA-Z0-9]{50,}"),
+    "XAI": re.compile(r"xai-[a-zA-Z0-9]{32,}"),
+    "DeepSeek": re.compile(r"sk-[a-zA-Z0-9]{32,}"),
+    "Gemini": re.compile(r"AIza[0-9A-Za-z\-_]{35}"),
+    "Anthropic": re.compile(r"sk-ant-api[0-9A-Za-z\-_]{40,}"),
+    "Replicate": re.compile(r"r8_[a-zA-Z0-9]{32,}"),
+    "HuggingFace": re.compile(r"hf_[a-zA-Z0-9]{30,}"),
+    "MiMo": re.compile(r"tp-[a-zA-Z0-9]{10,}"),
+    "MiniMax": re.compile(r"sk-api-[a-zA-Z0-9]{100,}"),
+    "Perplexity": re.compile(r"pplx-[a-zA-Z0-9]{32,}"),
+    "GitHub_PAT": re.compile(r"github_pat_[a-zA-Z0-9_]{50,}"),
+    "GitHub_Token": re.compile(r"ghp_[a-zA-Z0-9]{36}"),
+    "Stripe_Live": re.compile(r"sk_live_[a-zA-Z0-9]{24,}"),
+    "Stripe_Test": re.compile(r"sk_test_[a-zA-Z0-9]{24,}"),
+}
+
+# ---------- Verifiers (simplified REST versions) ----------
+VERIFIERS: Dict[str, Dict[str, Any]] = {
+    "OpenAI": {
+        "url": "https://api.openai.com/v1/models",
+        "headers": lambda k: {"Authorization": f"Bearer {k}"},
+        "parse": lambda code, data: (True, 0, "Valid") if code == 200 else (False, 0, "Invalid") if code == 401 else (False, 0, f"HTTP {code}")
+    },
+    "OpenAI_Legacy": {
+        "url": "https://api.openai.com/v1/models",
+        "headers": lambda k: {"Authorization": f"Bearer {k}"},
+        "parse": lambda code, data: (True, 0, "Valid") if code == 200 else (False, 0, "Invalid") if code == 401 else (False, 0, f"HTTP {code}")
+    },
+    "OpenRouter": {
+        "url": "https://openrouter.ai/api/v1/auth/key",
+        "headers": lambda k: {"Authorization": f"Bearer {k}"},
+        "parse": lambda code, data: (True, 0, "Valid") if code == 200 else (False, 0, f"HTTP {code}")
+    },
+    "XAI": {
+        "url": "https://api.x.ai/v1/models",
+        "headers": lambda k: {"Authorization": f"Bearer {k}"},
+        "parse": lambda code, data: (True, 0, "Valid") if code == 200 else (False, 0, f"HTTP {code}")
+    },
+    "DeepSeek": {
+        "url": "https://api.deepseek.com/user/balance",
+        "headers": lambda k: {"Authorization": f"Bearer {k}", "Accept": "application/json"},
+        "parse": lambda code, data: (
+            (True, 0, "Valid") if code == 200 and data.get("is_available") else
+            (False, 0, "Invalid") if code == 401 else
+            (False, 0, f"HTTP {code}")
+        )
+    },
+    "Gemini": {
+        "url": lambda k: f"https://generativelanguage.googleapis.com/v1/models?key={k}",
+        "headers": lambda k: {},
+        "parse": lambda code, data: (
+            (True, 0, "Valid") if code == 200 else
+            (False, 0, "Invalid (403)") if code == 403 else
+            (False, 0, f"HTTP {code}")
+        )
+    },
+    "Anthropic": {
+        "url": "https://api.anthropic.com/v1/messages",
+        "headers": lambda k: {"x-api-key": k, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
+        "body": lambda: json.dumps({"model": "claude-3-haiku-20240307", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}),
+        "method": "POST",
+        "parse": lambda code, data: (True, 0, "Valid") if code == 200 else (False, 0, f"HTTP {code}")
+    },
+    "Replicate": {
+        "url": "https://api.replicate.com/v1/account",
+        "headers": lambda k: {"Authorization": f"Bearer {k}"},
+        "parse": lambda code, data: (True, 0, "Valid") if code == 200 else (False, 0, f"HTTP {code}")
+    },
+    "HuggingFace": {
+        "url": "https://huggingface.co/api/whoami",
+        "headers": lambda k: {"Authorization": f"Bearer {k}"},
+        "parse": lambda code, data: (True, 0, "Valid") if code == 200 else (False, 0, f"HTTP {code}")
+    },
+    "MiMo": {
+        "url": "https://token-plan-cn.xiaomimimo.com/v1/models",
+        "headers": lambda k: {"Authorization": f"Bearer {k}", "X-Plan-Type": "token-plan"},
+        "parse": lambda code, data: (True, 0, "Valid") if code == 200 else (False, 0, f"HTTP {code}")
+    },
+    "MiniMax": {
+        "url": "https://api.minimax.io/v1/models",
+        "headers": lambda k: {"Authorization": f"Bearer {k}"},
+        "parse": lambda code, data: (True, 0, "Valid") if code == 200 else (False, 0, f"HTTP {code}")
+    },
+    "Perplexity": {
+        "url": "https://api.perplexity.ai/chat/completions",
+        "headers": lambda k: {"Authorization": f"Bearer {k}", "Content-Type": "application/json"},
+        "body": lambda: json.dumps({"model": "llama-3.1-sonar-small-128k-online", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}),
+        "method": "POST",
+        "parse": lambda code, data: (True, 0, "Valid") if code == 200 else (False, 0, f"HTTP {code}")
+    },
+    "GitHub_PAT": {
+        "url": "https://api.github.com/user",
+        "headers": lambda k: {"Authorization": f"Bearer {k}"},
+        "parse": lambda code, data: (True, 0, "Valid") if code == 200 else (False, 0, "Invalid")
+    },
+    "GitHub_Token": {
+        "url": "https://api.github.com/user",
+        "headers": lambda k: {"Authorization": f"Bearer {k}"},
+        "parse": lambda code, data: (True, 0, "Valid") if code == 200 else (False, 0, "Invalid")
+    },
+    "Stripe_Live": {
+        "url": "https://api.stripe.com/v1/account",
+        "headers": lambda k: {"Authorization": f"Bearer {k}"},
+        "parse": lambda code, data: (True, 0, "Valid") if code == 200 else (False, 0, "Invalid") if code == 401 else (False, 0, f"HTTP {code}")
+    },
+    "Stripe_Test": {
+        "url": "https://api.stripe.com/v1/account",
+        "headers": lambda k: {"Authorization": f"Bearer {k}"},
+        "parse": lambda code, data: (True, 0, "Valid") if code == 200 else (False, 0, "Invalid") if code == 401 else (False, 0, f"HTTP {code}")
+    },
+}
 
 # ---------- GitHub App token ----------
 def get_installation_token() -> Optional[str]:
@@ -55,12 +166,12 @@ def get_installation_token() -> Optional[str]:
         print(f"❌ App auth error: {e}")
         return None
 
-# ---------- GitHub API request with retry on 401 / 429 ----------
+# ---------- GitHub API request with retry ----------
 def gh_request(method, url, token, json_data=None, retries=2):
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
-        "User-Agent": "FalsePositiveCleaner/1.0"
+        "User-Agent": "Revalidator/1.0"
     }
     for attempt in range(retries + 1):
         try:
@@ -92,90 +203,235 @@ def gh_request(method, url, token, json_data=None, retries=2):
 
     return resp
 
+# ---------- Extract source URL from issue body ----------
+def extract_source_url(body: str) -> Optional[str]:
+    """Extract the source URL from the issue body (table format)."""
+    # Look for "Source URL" row in markdown table
+    match = re.search(r'Source URL\s*\|\s*(https?://[^\s|]+)', body)
+    if match:
+        url = match.group(1).strip()
+        # Remove trailing "..."
+        if url.endswith('...'):
+            # The full URL might be truncated; try to find it elsewhere in body
+            # Usually the full URL is in the "Source:" line of the message part
+            match_full = re.search(r'Source:\s*(https?://[^\s]+)', body)
+            if match_full:
+                url = match_full.group(1).strip()
+        return url
+    # Alternative: find "Source:" line
+    match = re.search(r'Source:\s*(https?://[^\s]+)', body)
+    if match:
+        return match.group(1).strip()
+    return None
+
+# ---------- Fetch content from source URL ----------
+def get_content_from_url(source_url: str, token: str) -> Optional[str]:
+    """Download file/diff content from a GitHub blob/commit/issue/PR URL."""
+    session = requests.Session()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "Revalidator/1.0"
+    }
+
+    try:
+        if "/blob/" in source_url:
+            # Convert to raw URL
+            parts = source_url.replace("https://github.com/", "").split("/blob/")
+            if len(parts) == 2:
+                repo_path = parts[0]
+                ref_path = parts[1]
+                raw_url = f"https://raw.githubusercontent.com/{repo_path}/{ref_path}"
+                resp = session.get(raw_url, headers={"User-Agent": "Revalidator/1.0"}, timeout=15)
+                if resp.status_code == 200:
+                    return resp.text
+        elif "/commit/" in source_url:
+            # Download commit diff
+            parts = source_url.replace("https://github.com/", "").split("/commit/")
+            if len(parts) == 2:
+                diff_url = f"https://github.com/{parts[0]}/commit/{parts[1]}.diff"
+                resp = session.get(diff_url, headers=headers, timeout=15)
+                if resp.status_code == 200:
+                    return resp.text
+        elif "/pull/" in source_url:
+            # Get PR diff
+            parts = source_url.replace("https://github.com/", "").split("/pull/")
+            if len(parts) == 2:
+                repo_path = parts[0]
+                pr_number = parts[1].split("#")[0]
+                diff_url = f"https://api.github.com/repos/{repo_path}/pulls/{pr_number}"
+                resp = session.get(diff_url, headers=headers, timeout=15)
+                if resp.status_code == 200:
+                    pr_data = resp.json()
+                    diff_url = pr_data.get("diff_url")
+                    if diff_url:
+                        diff_resp = session.get(diff_url, headers={"Accept": "application/vnd.github.v3.diff"}, timeout=15)
+                        if diff_resp.status_code == 200:
+                            return diff_resp.text
+        elif "/issues/" in source_url:
+            # Get issue body
+            parts = source_url.replace("https://github.com/", "").split("/issues/")
+            if len(parts) == 2:
+                repo_path = parts[0]
+                issue_number = parts[1].split("#")[0]
+                api_url = f"https://api.github.com/repos/{repo_path}/issues/{issue_number}"
+                resp = session.get(api_url, headers=headers, timeout=15)
+                if resp.status_code == 200:
+                    issue_data = resp.json()
+                    return issue_data.get("body", "")
+    except Exception as e:
+        print(f"    ⚠️ Error fetching content: {e}")
+
+    return None
+
+# ---------- Verify a single key ----------
+def verify_key(service: str, key: str) -> Tuple[bool, float, str]:
+    verifier = VERIFIERS.get(service)
+    if not verifier:
+        return False, 0, "Unknown service"
+
+    try:
+        url = verifier["url"](key) if callable(verifier["url"]) else verifier["url"]
+        headers = verifier["headers"](key)
+        method = verifier.get("method", "GET")
+        body = None
+        if "body" in verifier:
+            body = verifier["body"]()
+
+        if method == "GET":
+            resp = requests.get(url, headers=headers, timeout=10)
+        else:
+            resp = requests.post(url, headers=headers, data=body, timeout=10)
+
+        try:
+            data = resp.json()
+        except Exception:
+            data = None
+        return verifier["parse"](resp.status_code, data)
+    except Exception as e:
+        return False, 0, f"Error: {str(e)[:30]}"
+
 # ---------- Main ----------
 def main():
     token = PAT_TOKEN
     if not token:
         token = get_installation_token()
     if not token:
-        print("❌ No authentication token available. Set PAT_TOKEN or App credentials.")
+        print("❌ No authentication token available.")
         sys.exit(1)
 
-    print(f"🔍 Keywords to match: {KEYWORDS}")
+    owner, repo = REPO_NAME.split("/")
 
-    # Search for all open issues in the repo
-    query = f'repo:{REPO_NAME} is:issue is:open'
-    url = f"https://api.github.com/search/issues?q={requests.utils.quote(query)}&per_page=100"
+    print(f"🔍 Scanning open issues in {REPO_NAME}...")
 
-    total_closed = 0
-    total_skipped = 0
-    page_num = 1
+    # Get all open issues
+    issues_url = f"https://api.github.com/repos/{owner}/{repo}/issues?state=open&per_page=100"
+    page = 1
+    total_processed = 0
+    total_invalid = 0
 
-    while url:
-        print(f"\n🔍 Fetching page {page_num}...")
-        resp = gh_request("GET", url, token)
+    while issues_url:
+        print(f"\n📄 Fetching issues page {page}...")
+        resp = gh_request("GET", issues_url, token)
         if resp.status_code != 200:
-            print(f"❌ Search failed after retries: HTTP {resp.status_code}")
-            print(resp.text)
+            print(f"❌ Failed to fetch issues: {resp.status_code}")
             break
 
-        data = resp.json()
-        items = data.get("items", [])
-        if not items:
-            print("No more open issues found.")
+        issues = resp.json()
+        if not issues:
             break
 
-        print(f"Found {len(items)} open issues on this page.")
-
-        for item in items:
-            body = item.get("body", "")
-            # Check if body contains any of the target keywords
-            matched_keywords = [kw for kw in KEYWORDS if kw.lower() in body.lower()]
-            if not matched_keywords:
-                total_skipped += 1
+        for issue in issues:
+            # Skip pull requests (they appear in issues list)
+            if "pull_request" in issue:
                 continue
 
-            issue_number = item["number"]
-            title = item["title"]
-            print(f"  🎯 #{issue_number}: {title}   (matched: {matched_keywords})")
-
-            if DRY_RUN:
-                print("      [DRY RUN] Would close and comment.")
-                total_closed += 1
+            issue_number = issue["number"]
+            title = issue["title"]
+            body = issue.get("body", "")
+            if not body:
                 continue
 
-            # Add explanatory comment
-            comment_url = f"https://api.github.com/repos/{REPO_NAME}/issues/{issue_number}/comments"
-            comment_body = (
-                "⚠️ This issue has been automatically closed because the API key was "
-                "incorrectly marked as valid in an older version of the scanner.\n\n"
-                f"The original response was: {', '.join(matched_keywords)}.\n"
-                "This is now treated as **invalid** by the current scanner.\n"
-                "If this is a real leak, it will be re-detected and re-reported correctly."
-            )
-            comment_resp = gh_request("POST", comment_url, token, {"body": comment_body})
-            if comment_resp.status_code not in (200, 201):
-                print(f"      ⚠️ Failed to add comment: HTTP {comment_resp.status_code}")
+            total_processed += 1
+            print(f"\n📝 #{issue_number}: {title}")
 
-            # Close the issue
-            patch_url = f"https://api.github.com/repos/{REPO_NAME}/issues/{issue_number}"
-            patch_resp = gh_request("PATCH", patch_url, token, {"state": "closed"})
-            if patch_resp.status_code == 200:
-                total_closed += 1
-                print(f"      ✅ Closed")
-            else:
-                print(f"      ❌ Failed to close: HTTP {patch_resp.status_code}")
+            source_url = extract_source_url(body)
+            if not source_url:
+                print("  ⏭️ No source URL found, skipping")
+                continue
 
-            time.sleep(1)  # respect rate limits
+            print(f"  🔗 Source: {source_url}")
+
+            # Fetch content
+            content = get_content_from_url(source_url, token)
+            if not content:
+                print("  ⚠️ Could not fetch content, skipping")
+                continue
+
+            # Extract all keys
+            found_keys = set()
+            for service, pattern in KEY_PATTERNS.items():
+                for match in pattern.finditer(content):
+                    key = match.group(0)
+                    found_keys.add((service, key))
+
+            if not found_keys:
+                print("  ℹ️ No keys found in content, skipping")
+                continue
+
+            # Re-verify each key found
+            any_valid = False
+            for service, key in found_keys:
+                print(f"    🔑 Verifying {service}: {key[:25]}...")
+                valid, _, info = verify_key(service, key)
+                if valid:
+                    print(f"      ✅ Still valid: {info}")
+                    any_valid = True
+                else:
+                    print(f"      ❌ Now invalid: {info}")
+
+            # If no key is valid anymore, comment and optionally close
+            if not any_valid:
+                print(f"  🚨 All keys in this issue are now INVALID.")
+                total_invalid += 1
+
+                if DRY_RUN:
+                    print("      [DRY RUN] Would add comment and optionally close.")
+                    continue
+
+                # Add comment
+                comment_body = (
+                    "⚠️ **Re-verification result**: All API keys previously reported in this issue "
+                    "are now **invalid** (revoked/expired/disabled).\n\n"
+                    "This issue can be closed if no longer relevant."
+                )
+                comment_url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/comments"
+                comment_resp = gh_request("POST", comment_url, token, {"body": comment_body})
+                if comment_resp.status_code in (200, 201):
+                    print("      💬 Comment added.")
+                else:
+                    print(f"      ⚠️ Failed to add comment: {comment_resp.status_code}")
+
+                if CLOSE_INVALID:
+                    patch_url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}"
+                    patch_resp = gh_request("PATCH", patch_url, token, {"state": "closed"})
+                    if patch_resp.status_code == 200:
+                        print("      🔒 Issue closed.")
+                    else:
+                        print(f"      ❌ Failed to close: {patch_resp.status_code}")
+
+            # Delay between issues to avoid rate limit
+            time.sleep(1)
 
         # Pagination
-        if "next" in resp.links:
-            url = resp.links["next"]["url"]
-            page_num += 1
+        links = resp.links
+        if "next" in links:
+            issues_url = links["next"]["url"]
+            page += 1
         else:
-            url = None
+            issues_url = None
 
-    print(f"\n✅ Finished. Closed: {total_closed}, Skipped: {total_skipped}")
+    print(f"\n✅ Done. Processed {total_processed} issues, {total_invalid} are now fully invalid.")
 
 if __name__ == "__main__":
     try:
