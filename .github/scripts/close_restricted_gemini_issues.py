@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 Re-verify all keys reported in open issues within our own repo.
-If a previously valid key is now invalid, comment and optionally close the issue.
+If all keys are now invalid, comment and CLOSE the issue automatically.
+Handles missing Source URL by searching body for full keys.
 
 Usage:
   DRY_RUN=true python revalidate_issues.py   # preview only
-  python revalidate_issues.py                 # actually comment/close
+  python revalidate_issues.py                 # actually comment and close invalid issues
 """
 
 import os
@@ -16,7 +17,7 @@ import json
 import urllib.parse
 import requests
 import jwt
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, Set
 
 # ---------- Configuration ----------
 REPO_NAME = os.environ.get("GITHUB_REPOSITORY", "Colorful-glassblock/Dont-Be-Stupid-Leaker")
@@ -25,9 +26,9 @@ APP_ID = os.environ.get("APP_ID")
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY")
 INSTALLATION_ID = os.environ.get("INSTALLATION_ID")
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
-CLOSE_INVALID = os.environ.get("CLOSE_INVALID", "false").lower() == "true"   # also close issue if invalid
+CLOSE_INVALID = os.environ.get("CLOSE_INVALID", "true").lower() != "false"   # default: close
 
-# ---------- Key Patterns (copied from scanner) ----------
+# ---------- Key Patterns ----------
 KEY_PATTERNS = {
     "OpenAI": re.compile(r"sk-proj-[a-zA-Z0-9_\-]{50,}"),
     "OpenAI_Legacy": re.compile(r"sk-[a-zA-Z0-9]{32,}"),
@@ -47,7 +48,7 @@ KEY_PATTERNS = {
     "Stripe_Test": re.compile(r"sk_test_[a-zA-Z0-9]{24,}"),
 }
 
-# ---------- Verifiers (simplified REST versions) ----------
+# ---------- Verifiers ----------
 VERIFIERS: Dict[str, Dict[str, Any]] = {
     "OpenAI": {
         "url": "https://api.openai.com/v1/models",
@@ -166,7 +167,7 @@ def get_installation_token() -> Optional[str]:
         print(f"❌ App auth error: {e}")
         return None
 
-# ---------- GitHub API request with retry ----------
+# ---------- GitHub API request ----------
 def gh_request(method, url, token, json_data=None, retries=2):
     headers = {
         "Authorization": f"Bearer {token}",
@@ -205,20 +206,17 @@ def gh_request(method, url, token, json_data=None, retries=2):
 
 # ---------- Extract source URL from issue body ----------
 def extract_source_url(body: str) -> Optional[str]:
-    """Extract the source URL from the issue body (table format)."""
-    # Look for "Source URL" row in markdown table
+    # Table format: "Source URL | https://..."
     match = re.search(r'Source URL\s*\|\s*(https?://[^\s|]+)', body)
     if match:
         url = match.group(1).strip()
-        # Remove trailing "..."
         if url.endswith('...'):
-            # The full URL might be truncated; try to find it elsewhere in body
-            # Usually the full URL is in the "Source:" line of the message part
+            # Try full URL from "Source:" line
             match_full = re.search(r'Source:\s*(https?://[^\s]+)', body)
             if match_full:
                 url = match_full.group(1).strip()
         return url
-    # Alternative: find "Source:" line
+    # Plain "Source:" line
     match = re.search(r'Source:\s*(https?://[^\s]+)', body)
     if match:
         return match.group(1).strip()
@@ -226,17 +224,14 @@ def extract_source_url(body: str) -> Optional[str]:
 
 # ---------- Fetch content from source URL ----------
 def get_content_from_url(source_url: str, token: str) -> Optional[str]:
-    """Download file/diff content from a GitHub blob/commit/issue/PR URL."""
     session = requests.Session()
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "User-Agent": "Revalidator/1.0"
     }
-
     try:
         if "/blob/" in source_url:
-            # Convert to raw URL
             parts = source_url.replace("https://github.com/", "").split("/blob/")
             if len(parts) == 2:
                 repo_path = parts[0]
@@ -246,7 +241,6 @@ def get_content_from_url(source_url: str, token: str) -> Optional[str]:
                 if resp.status_code == 200:
                     return resp.text
         elif "/commit/" in source_url:
-            # Download commit diff
             parts = source_url.replace("https://github.com/", "").split("/commit/")
             if len(parts) == 2:
                 diff_url = f"https://github.com/{parts[0]}/commit/{parts[1]}.diff"
@@ -254,7 +248,6 @@ def get_content_from_url(source_url: str, token: str) -> Optional[str]:
                 if resp.status_code == 200:
                     return resp.text
         elif "/pull/" in source_url:
-            # Get PR diff
             parts = source_url.replace("https://github.com/", "").split("/pull/")
             if len(parts) == 2:
                 repo_path = parts[0]
@@ -269,7 +262,6 @@ def get_content_from_url(source_url: str, token: str) -> Optional[str]:
                         if diff_resp.status_code == 200:
                             return diff_resp.text
         elif "/issues/" in source_url:
-            # Get issue body
             parts = source_url.replace("https://github.com/", "").split("/issues/")
             if len(parts) == 2:
                 repo_path = parts[0]
@@ -281,7 +273,6 @@ def get_content_from_url(source_url: str, token: str) -> Optional[str]:
                     return issue_data.get("body", "")
     except Exception as e:
         print(f"    ⚠️ Error fetching content: {e}")
-
     return None
 
 # ---------- Verify a single key ----------
@@ -289,7 +280,6 @@ def verify_key(service: str, key: str) -> Tuple[bool, float, str]:
     verifier = VERIFIERS.get(service)
     if not verifier:
         return False, 0, "Unknown service"
-
     try:
         url = verifier["url"](key) if callable(verifier["url"]) else verifier["url"]
         headers = verifier["headers"](key)
@@ -297,12 +287,10 @@ def verify_key(service: str, key: str) -> Tuple[bool, float, str]:
         body = None
         if "body" in verifier:
             body = verifier["body"]()
-
         if method == "GET":
             resp = requests.get(url, headers=headers, timeout=10)
         else:
             resp = requests.post(url, headers=headers, data=body, timeout=10)
-
         try:
             data = resp.json()
         except Exception:
@@ -310,6 +298,14 @@ def verify_key(service: str, key: str) -> Tuple[bool, float, str]:
         return verifier["parse"](resp.status_code, data)
     except Exception as e:
         return False, 0, f"Error: {str(e)[:30]}"
+
+# ---------- Extract keys from text ----------
+def extract_keys_from_text(text: str) -> Set[Tuple[str, str]]:
+    keys = set()
+    for service, pattern in KEY_PATTERNS.items():
+        for match in pattern.finditer(text):
+            keys.add((service, match.group(0)))
+    return keys
 
 # ---------- Main ----------
 def main():
@@ -321,10 +317,8 @@ def main():
         sys.exit(1)
 
     owner, repo = REPO_NAME.split("/")
+    print(f"🔍 Scanning open issues in {REPO_NAME}... (CLOSE_INVALID={CLOSE_INVALID})")
 
-    print(f"🔍 Scanning open issues in {REPO_NAME}...")
-
-    # Get all open issues
     issues_url = f"https://api.github.com/repos/{owner}/{repo}/issues?state=open&per_page=100"
     page = 1
     total_processed = 0
@@ -342,7 +336,6 @@ def main():
             break
 
         for issue in issues:
-            # Skip pull requests (they appear in issues list)
             if "pull_request" in issue:
                 continue
 
@@ -355,31 +348,31 @@ def main():
             total_processed += 1
             print(f"\n📝 #{issue_number}: {title}")
 
+            # First try to get keys from source URL content
             source_url = extract_source_url(body)
-            if not source_url:
-                print("  ⏭️ No source URL found, skipping")
-                continue
+            found_keys: Set[Tuple[str, str]] = set()
 
-            print(f"  🔗 Source: {source_url}")
+            if source_url:
+                print(f"  🔗 Source: {source_url}")
+                content = get_content_from_url(source_url, token)
+                if content:
+                    found_keys = extract_keys_from_text(content)
+                else:
+                    print("  ⚠️ Could not fetch content from URL, will try extracting from body.")
+            else:
+                print("  ⏭️ No source URL found, extracting keys from issue body directly.")
 
-            # Fetch content
-            content = get_content_from_url(source_url, token)
-            if not content:
-                print("  ⚠️ Could not fetch content, skipping")
-                continue
-
-            # Extract all keys
-            found_keys = set()
-            for service, pattern in KEY_PATTERNS.items():
-                for match in pattern.finditer(content):
-                    key = match.group(0)
-                    found_keys.add((service, key))
+            # If no keys found from source, try the body itself
+            if not found_keys:
+                found_keys = extract_keys_from_text(body)
+                # Filter out masked keys (those containing "...") - they can't be verified
+                found_keys = {(s, k) for s, k in found_keys if "..." not in k}
 
             if not found_keys:
-                print("  ℹ️ No keys found in content, skipping")
+                print("  ℹ️ No verifiable keys found, skipping.")
                 continue
 
-            # Re-verify each key found
+            # Re-verify each key
             any_valid = False
             for service, key in found_keys:
                 print(f"    🔑 Verifying {service}: {key[:25]}...")
@@ -390,20 +383,20 @@ def main():
                 else:
                     print(f"      ❌ Now invalid: {info}")
 
-            # If no key is valid anymore, comment and optionally close
+            # If all keys are invalid
             if not any_valid:
                 print(f"  🚨 All keys in this issue are now INVALID.")
                 total_invalid += 1
 
                 if DRY_RUN:
-                    print("      [DRY RUN] Would add comment and optionally close.")
+                    print("      [DRY RUN] Would add comment and close.")
                     continue
 
                 # Add comment
                 comment_body = (
                     "⚠️ **Re-verification result**: All API keys previously reported in this issue "
                     "are now **invalid** (revoked/expired/disabled).\n\n"
-                    "This issue can be closed if no longer relevant."
+                    "This issue has been automatically closed."
                 )
                 comment_url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/comments"
                 comment_resp = gh_request("POST", comment_url, token, {"body": comment_body})
@@ -420,7 +413,6 @@ def main():
                     else:
                         print(f"      ❌ Failed to close: {patch_resp.status_code}")
 
-            # Delay between issues to avoid rate limit
             time.sleep(1)
 
         # Pagination
@@ -431,7 +423,7 @@ def main():
         else:
             issues_url = None
 
-    print(f"\n✅ Done. Processed {total_processed} issues, {total_invalid} are now fully invalid.")
+    print(f"\n✅ Done. Processed {total_processed} issues, {total_invalid} now fully invalid and closed.")
 
 if __name__ == "__main__":
     try:
